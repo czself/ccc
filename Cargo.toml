@@ -8,3 +8,4 @@ ratatui = "0.29"
 crossterm = "0.28"
 syntect = { version = "5.2", default-features = false, features = ["default-fancy"] }
 ureq = "3"
+zip = "2"

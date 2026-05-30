@@ -1,11 +1,11 @@
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Clone)]
 pub enum Compiler {
     System { name: String },
-    Tcc { path: PathBuf },
+    Bundled { path: PathBuf },
 }
 
 pub struct BuildResult {
@@ -23,12 +23,7 @@ pub struct CompilerInfo {
 fn probe_system_compiler(candidates: &[&str]) -> Option<Compiler> {
     for name in candidates {
         let mut cmd = Command::new(name);
-        // cl.exe uses different flag for version
-        if name == &"cl.exe" {
-            cmd.arg("/?");
-        } else {
-            cmd.arg("--version");
-        }
+        if name == &"cl.exe" { cmd.arg("/?"); } else { cmd.arg("--version"); }
         if cmd.output().is_ok() {
             return Some(Compiler::System { name: name.to_string() });
         }
@@ -36,7 +31,7 @@ fn probe_system_compiler(candidates: &[&str]) -> Option<Compiler> {
     None
 }
 
-fn tcc_cache_dir() -> PathBuf {
+fn cache_dir() -> PathBuf {
     let base = if cfg!(target_os = "windows") {
         std::env::var("LOCALAPPDATA")
             .or_else(|_| std::env::var("USERPROFILE"))
@@ -50,65 +45,78 @@ fn tcc_cache_dir() -> PathBuf {
     PathBuf::from(base).join(sub)
 }
 
-fn download_tcc() -> Option<PathBuf> {
-    let cache = tcc_cache_dir();
-    let arch = std::env::consts::ARCH;
-    let os = std::env::consts::OS;
+fn download_file(url: &str, dest: &Path) -> io::Result<()> {
+    let resp = ureq::get(url).call()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("HTTP: {}", e)))?;
+    let mut body: Vec<u8> = Vec::new();
+    resp.into_body().into_reader().read_to_end(&mut body)?;
+    std::fs::write(dest, &body)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755)).ok();
+    }
+    Ok(())
+}
 
-    let (url, exe_name) = match (os, arch) {
-        ("linux", "x86_64") => (
-            "https://github.com/sz3/tinycc/releases/download/v0.9.27/tcc-x86_64-linux",
-            "tcc",
-        ),
-        ("linux", "aarch64") => (
-            "https://github.com/sz3/tinycc/releases/download/v0.9.27/tcc-aarch64-linux",
-            "tcc",
-        ),
-        ("macos", "x86_64") => (
-            "https://github.com/sz3/tinycc/releases/download/v0.9.27/tcc-x86_64-macos",
-            "tcc",
-        ),
-        ("macos", "aarch64") => (
-            "https://github.com/sz3/tinycc/releases/download/v0.9.27/tcc-aarch64-macos",
-            "tcc",
-        ),
-        ("windows", "x86_64") => (
-            "https://github.com/sz3/tinycc/releases/download/v0.9.27/tcc-x86_64-win32.exe",
-            "tcc.exe",
-        ),
+fn download_tcc() -> Option<PathBuf> {
+    let cache = cache_dir();
+    let (url, exe_name) = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64")   => ("https://github.com/sz3/tinycc/releases/download/v0.9.27/tcc-x86_64-linux", "tcc"),
+        ("linux", "aarch64")  => ("https://github.com/sz3/tinycc/releases/download/v0.9.27/tcc-aarch64-linux", "tcc"),
+        ("macos", "x86_64")   => ("https://github.com/sz3/tinycc/releases/download/v0.9.27/tcc-x86_64-macos", "tcc"),
+        ("macos", "aarch64")  => ("https://github.com/sz3/tinycc/releases/download/v0.9.27/tcc-aarch64-macos", "tcc"),
+        ("windows", "x86_64") => ("https://github.com/sz3/tinycc/releases/download/v0.9.27/tcc-x86_64-win32.exe", "tcc.exe"),
         _ => return None,
     };
 
     std::fs::create_dir_all(&cache).ok()?;
     let exe_path = cache.join(exe_name);
+    if exe_path.exists() { return Some(exe_path); }
+    download_file(url, &exe_path).ok()?;
+    Some(exe_path)
+}
 
-    if exe_path.exists() {
-        return Some(exe_path);
+fn download_mingw() -> Option<PathBuf> {
+    let cache = cache_dir();
+    let mingw_root = cache.join("w64devkit");
+    let gpp_path = mingw_root.join("bin").join("g++.exe");
+
+    if gpp_path.exists() {
+        return Some(gpp_path);
     }
 
-    let _ = std::fs::write(&cache.join("tcc.url"), url);
+    std::fs::create_dir_all(&cache).ok()?;
 
-    let response = ureq::get(url).call();
-    match response {
-        Ok(resp) => {
-            let mut body: Vec<u8> = Vec::new();
-            let mut reader = resp.into_body().into_reader();
-            if reader.read_to_end(&mut body).is_ok() && !body.is_empty() {
-                std::fs::write(&exe_path, &body).ok()?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755)).ok()?;
-                }
-                return Some(exe_path);
-            }
-            None
-        }
-        Err(e) => {
-            let _ = std::fs::write(&cache.join("tcc.download_error"), format!("{}", e));
-            None
-        }
+    let zip_url = "https://github.com/skeeto/w64devkit/releases/download/v2.0.0/w64devkit-2.0.0.zip";
+    let zip_path = cache.join("w64devkit.zip");
+
+    if !zip_path.exists() {
+        download_file(zip_url, &zip_path).ok()?;
     }
+
+    let file = std::fs::File::open(&zip_path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).ok()?;
+        let name = entry.name().to_string();
+        let out_path = cache.join(&name);
+
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path).ok();
+            continue;
+        }
+
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let mut out = std::fs::File::create(&out_path).ok()?;
+        std::io::copy(&mut entry, &mut out).ok()?;
+    }
+
+    std::fs::remove_file(&zip_path).ok();
+    if gpp_path.exists() { Some(gpp_path) } else { None }
 }
 
 fn resolve_compiler(info: &CompilerInfo, ext: &str) -> (Option<Compiler>, Option<String>) {
@@ -123,15 +131,13 @@ fn resolve_compiler(info: &CompilerInfo, ext: &str) -> (Option<Compiler>, Option
         _ => return (None, Some(format!("Unsupported file type: .{}", ext))),
     };
 
-    // Try cached info first
+    // Check cached info first
     let from_info = match ext {
         "c" => info.cc.clone(),
         _ => info.cxx.clone(),
     };
     if let Some(c) = from_info {
-        if matches!(c, Compiler::System { .. } | Compiler::Tcc { .. }) {
-            return (Some(c), None);
-        }
+        return (Some(c), None);
     }
 
     // Probe system compiler
@@ -139,58 +145,47 @@ fn resolve_compiler(info: &CompilerInfo, ext: &str) -> (Option<Compiler>, Option
         return (Some(c), None);
     }
 
-    // Auto-download TCC (C only)
+    // Auto-download fallback
     if ext == "c" {
         if let Some(path) = download_tcc() {
-            return (Some(Compiler::Tcc { path }), None);
+            return (Some(Compiler::Bundled { path }), None);
         }
     }
 
-    let hint = match ext {
-        "c" => {
-            let os = std::env::consts::OS;
-            match os {
-                "linux" => "No C compiler. Install with: sudo apt install gcc  |  sudo dnf install gcc  |  sudo pacman -S gcc",
-                "macos" => "No C compiler. Install with: xcode-select --install  |  brew install gcc",
-                "windows" => "No C compiler. Download: https://winget.run/pkg/LLVM/LLVM  or  install MSVC Build Tools",
-                _ => "No C compiler found. Please install gcc or clang.",
-            }
+    if cfg!(target_os = "windows") && matches!(ext, "cpp" | "cc" | "cxx" | "c++") {
+        if let Some(path) = download_mingw() {
+            return (Some(Compiler::Bundled { path }), None);
         }
-        _ => {
-            let os = std::env::consts::OS;
-            match os {
-                "linux" => "No C++ compiler. Install with: sudo apt install g++  |  sudo dnf install gcc-c++  |  sudo pacman -S gcc",
-                "macos" => "No C++ compiler. Install with: xcode-select --install  |  brew install gcc",
-                "windows" => "No C++ compiler. Download: https://winget.run/pkg/LLVM/LLVM  or  install MSVC Build Tools",
-                _ => "No C++ compiler found. Please install g++ or clang++.",
-            }
-        }
+    }
+
+    let hint = match (ext, std::env::consts::OS) {
+        ("c", "linux") => "No C compiler. Install: sudo apt install gcc | sudo dnf install gcc | sudo pacman -S gcc",
+        ("c", "macos") => "No C compiler. Install: xcode-select --install | brew install gcc",
+        ("c", "windows") => "No C compiler found.",
+        (_, "linux") => "No C++ compiler. Install: sudo apt install g++ | sudo dnf install gcc-c++ | sudo pacman -S gcc",
+        (_, "macos") => "No C++ compiler. Install: xcode-select --install | brew install gcc",
+        (_, "windows") => "No C++ compiler found.",
+        _ => "No compiler found. Please install gcc/g++ or clang.",
     };
     (None, Some(hint.to_string()))
 }
 
 pub fn probe_compilers() -> CompilerInfo {
-    let (cc, cc_problem) = resolve_compiler(&CompilerInfo { cc: None, cxx: None, problem: None }, "c");
-    let (cxx, cxx_problem) = resolve_compiler(&CompilerInfo { cc: cc.clone(), cxx: None, problem: None }, "cpp");
-    CompilerInfo {
-        cc,
-        cxx,
-        problem: cc_problem.or(cxx_problem),
+    let empty = CompilerInfo { cc: None, cxx: None, problem: None };
+    let (cc, _) = resolve_compiler(&empty, "c");
+    let (cxx, _) = resolve_compiler(&CompilerInfo { cc: cc.clone(), cxx: None, problem: None }, "cpp");
+    CompilerInfo { cc, cxx, problem: None }
+}
+
+fn compiler_exe(c: &Compiler) -> &Path {
+    match c {
+        Compiler::System { name } => Path::new(name),
+        Compiler::Bundled { path } => path.as_path(),
     }
 }
 
-fn compiler_name(c: &Compiler) -> &str {
-    match c {
-        Compiler::System { name } => name,
-        Compiler::Tcc { path } => path.to_str().unwrap_or("tcc"),
-    }
-}
-
-fn build_cmd(c: &Compiler) -> Command {
-    match c {
-        Compiler::System { name } => Command::new(name),
-        Compiler::Tcc { path } => Command::new(path),
-    }
+fn is_tcc(c: &Compiler) -> bool {
+    matches!(c, Compiler::Bundled { .. })
 }
 
 fn output_path(source_path: &str) -> String {
@@ -200,29 +195,27 @@ fn output_path(source_path: &str) -> String {
 
 pub fn compile(source_path: &str, compiler: &Compiler) -> io::Result<BuildResult> {
     let out = output_path(source_path);
-    let compiler_str = compiler_name(compiler);
+    let compiler_str = compiler_exe(compiler).to_string_lossy().to_string();
 
-    let flags: &[&str] = match compiler {
-        Compiler::Tcc { .. } => &["-o", &out, source_path],
-        Compiler::System { .. } => &["-Wall", "-o", &out, source_path],
+    let flags: &[&str] = if is_tcc(compiler) {
+        &["-o", &out, source_path]
+    } else {
+        &["-Wall", "-o", &out, source_path]
     };
 
     let cmd_line = format!("{} {}", compiler_str, flags.join(" "));
-    let result = build_cmd(compiler).args(flags).output()?;
+    let result = Command::new(compiler_exe(compiler)).args(flags).output()?;
 
-    let output_text = String::from_utf8_lossy(&result.stderr).to_string();
     Ok(BuildResult {
         success: result.status.success(),
-        output: output_text,
+        output: String::from_utf8_lossy(&result.stderr).to_string(),
         command_line: cmd_line,
     })
 }
 
 pub fn compile_and_run(source_path: &str, compiler: &Compiler) -> io::Result<BuildResult> {
     let build = compile(source_path, compiler)?;
-    if !build.success {
-        return Ok(build);
-    }
+    if !build.success { return Ok(build); }
 
     let out = output_path(source_path);
     let run_path = if cfg!(target_os = "windows") {
@@ -233,9 +226,7 @@ pub fn compile_and_run(source_path: &str, compiler: &Compiler) -> io::Result<Bui
     let run_result = Command::new(&run_path).output()?;
 
     let mut full_output = build.output.clone();
-    if !full_output.is_empty() {
-        full_output.push_str("\n---\n");
-    }
+    if !full_output.is_empty() { full_output.push_str("\n---\n"); }
     full_output.push_str(&format!("$ {}\n", run_path));
     full_output.push_str(&String::from_utf8_lossy(&run_result.stdout));
     if !run_result.stderr.is_empty() {
