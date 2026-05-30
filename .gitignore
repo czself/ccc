@@ -1,0 +1,6 @@
+/target
+*.out
+*.exe
+*.o
+*.obj
+.DS_Store
