@@ -116,6 +116,7 @@ pub struct Editor {
     pub pending_mkfile: Option<PathBuf>,
     pub pending_mkdir: Option<PathBuf>,
     pub compiler_info: CompilerInfo,
+    pub confirm_quit: bool,
 }
 
 impl Editor {
@@ -135,6 +136,7 @@ impl Editor {
             pending_mkfile: None,
             pending_mkdir: None,
             compiler_info: probe_compilers(),
+            confirm_quit: false,
         }
     }
 
@@ -304,6 +306,7 @@ impl Editor {
     }
 
     pub fn save(&mut self) -> bool {
+        self.confirm_quit = false;
         if self.buffer.filepath.is_none() {
             self.prompt = Some(Prompt::new("Save as:"));
             return false;

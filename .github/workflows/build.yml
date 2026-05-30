@@ -6,6 +6,9 @@ on:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
@@ -35,11 +38,13 @@ jobs:
 
       - run: cargo build --release --target ${{ matrix.target }}
 
+      - run: cp target/${{ matrix.target }}/release/tinyvim${{ matrix.suffix }} tinyvim-${{ matrix.target }}${{ matrix.suffix }}
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: tinyvim-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/tinyvim${{ matrix.suffix }}
+          path: tinyvim-${{ matrix.target }}${{ matrix.suffix }}
 
   release:
     needs: build
@@ -52,6 +57,8 @@ jobs:
           pattern: tinyvim-*
           merge-multiple: true
 
+      - run: ls -la
+
       - uses: softprops/action-gh-release@v2
         with:
           files: |
@@ -59,4 +66,3 @@ jobs:
             tinyvim-x86_64-apple-darwin
             tinyvim-aarch64-apple-darwin
             tinyvim-x86_64-pc-windows-msvc.exe
-          generate_release_notes: true

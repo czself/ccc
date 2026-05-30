@@ -190,7 +190,8 @@ fn is_tcc(c: &Compiler) -> bool {
 
 fn output_path(source_path: &str) -> String {
     let ext = if cfg!(target_os = "windows") { ".exe" } else { ".out" };
-    source_path.trim_end_matches(|c| c == '.').to_string() + ext
+    let p = std::path::Path::new(source_path);
+    format!("{}{}", p.with_extension("").display(), ext)
 }
 
 pub fn compile(source_path: &str, compiler: &Compiler) -> io::Result<BuildResult> {

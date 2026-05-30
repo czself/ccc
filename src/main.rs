@@ -74,13 +74,15 @@ fn handle_event(editor: &mut Editor) -> io::Result<()> {
                 handle_alt(editor, c);
             }
             KeyCode::Char(c) => {
+                editor.confirm_quit = false;
                 editor.insert_char(c);
             }
-            KeyCode::Enter => editor.insert_char('\n'),
-            KeyCode::Backspace => editor.backspace(),
-            KeyCode::Delete => editor.delete(),
-            KeyCode::Tab => editor.insert_char('\t'),
+            KeyCode::Enter => { editor.confirm_quit = false; editor.insert_char('\n'); }
+            KeyCode::Backspace => { editor.confirm_quit = false; editor.backspace(); }
+            KeyCode::Delete => { editor.confirm_quit = false; editor.delete(); }
+            KeyCode::Tab => { editor.confirm_quit = false; editor.insert_char('\t'); }
             KeyCode::Esc => {
+                editor.confirm_quit = false;
                 editor.selection = None;
                 editor.show_output = false;
             }
@@ -260,13 +262,13 @@ fn handle_prompt(editor: &mut Editor) -> io::Result<()> {
 }
 
 fn handle_ctrl(editor: &mut Editor, c: char) {
+    if c != 'q' { editor.confirm_quit = false; }
     match c {
         's' => { editor.save(); }
         'q' => {
-            if editor.buffer.modified {
-                editor.message = "Unsaved changes. Press Ctrl+S to save, or Ctrl+Q again to force quit.".to_string();
-                editor.buffer.modified = false;
-                editor.quit = true;
+            if editor.buffer.modified && !editor.confirm_quit {
+                editor.confirm_quit = true;
+                editor.message = "Unsaved changes. Press Ctrl+S to save, or Ctrl+Q again to force quit.";
             } else {
                 editor.quit = true;
             }
@@ -299,6 +301,7 @@ fn handle_ctrl(editor: &mut Editor, c: char) {
 }
 
 fn handle_alt(editor: &mut Editor, c: char) {
+    editor.confirm_quit = false;
     match c {
         'h' => editor.move_word_left(),
         'l' => editor.move_word_right(),
@@ -307,6 +310,7 @@ fn handle_alt(editor: &mut Editor, c: char) {
 }
 
 fn handle_fkey(editor: &mut Editor, f: u8) {
+    editor.confirm_quit = false;
     match f {
         5 => editor.do_compile(),
         6 => editor.do_compile_run(),
