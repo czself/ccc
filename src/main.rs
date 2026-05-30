@@ -268,7 +268,7 @@ fn handle_ctrl(editor: &mut Editor, c: char) {
         'q' => {
             if editor.buffer.modified && !editor.confirm_quit {
                 editor.confirm_quit = true;
-                editor.message = "Unsaved changes. Press Ctrl+S to save, or Ctrl+Q again to force quit.";
+                editor.message = "Unsaved changes. Press Ctrl+S to save, or Ctrl+Q again to force quit.".to_string();
             } else {
                 editor.quit = true;
             }
