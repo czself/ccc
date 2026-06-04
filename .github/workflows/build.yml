@@ -16,15 +16,19 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            artifact: tinyvim-x86_64-linux
             suffix: ""
           - os: macos-latest
             target: x86_64-apple-darwin
+            artifact: tinyvim-x86_64-macos
             suffix: ""
           - os: macos-latest
             target: aarch64-apple-darwin
+            artifact: tinyvim-aarch64-macos
             suffix: ""
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            artifact: tinyvim-x86_64-windows
             suffix: ".exe"
 
     runs-on: ${{ matrix.os }}
@@ -38,13 +42,13 @@ jobs:
 
       - run: cargo build --release --target ${{ matrix.target }}
 
-      - run: cp target/${{ matrix.target }}/release/tinyvim${{ matrix.suffix }} tinyvim-${{ matrix.target }}${{ matrix.suffix }}
+      - run: cp target/${{ matrix.target }}/release/tinyvim${{ matrix.suffix }} ${{ matrix.artifact }}${{ matrix.suffix }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tinyvim-${{ matrix.target }}
-          path: tinyvim-${{ matrix.target }}${{ matrix.suffix }}
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}${{ matrix.suffix }}
 
   release:
     needs: build
@@ -61,10 +65,10 @@ jobs:
 
       - run: |
           gh release create "${{ github.ref_name }}" \
-            tinyvim-x86_64-unknown-linux-gnu \
-            tinyvim-x86_64-apple-darwin \
-            tinyvim-aarch64-apple-darwin \
-            tinyvim-x86_64-pc-windows-msvc.exe \
+            tinyvim-x86_64-linux \
+            tinyvim-x86_64-macos \
+            tinyvim-aarch64-macos \
+            tinyvim-x86_64-windows.exe \
             --title "${{ github.ref_name }}" \
             --notes "See the [commit log](https://github.com/${{ github.repository }}/commits/${{ github.ref_name }}) for changes."
         env:

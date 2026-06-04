@@ -19,8 +19,15 @@ impl Buffer {
 
     pub fn load<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let content = fs::read_to_string(&path)?;
-        let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
-        let lines = if lines.is_empty() { vec![String::new()] } else { lines };
+        let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+        if content.ends_with('\n') {
+            lines.push(String::new());
+        }
+        let lines = if lines.is_empty() {
+            vec![String::new()]
+        } else {
+            lines
+        };
         Ok(Buffer {
             lines,
             filepath: Some(path.as_ref().to_string_lossy().to_string()),
@@ -45,7 +52,19 @@ impl Buffer {
     }
 
     pub fn line_len(&self, row: usize) -> usize {
-        if row < self.lines.len() { self.lines[row].len() } else { 0 }
+        if row < self.lines.len() {
+            self.lines[row].len()
+        } else {
+            0
+        }
+    }
+
+    pub fn line_char_count(&self, row: usize, col: usize) -> usize {
+        self.line_as_str(row)
+            .get(..col.min(self.line_len(row)))
+            .unwrap_or("")
+            .chars()
+            .count()
     }
 
     pub fn num_lines(&self) -> usize {
@@ -53,7 +72,11 @@ impl Buffer {
     }
 
     pub fn line_as_str(&self, row: usize) -> &str {
-        if row < self.lines.len() { &self.lines[row] } else { "" }
+        if row < self.lines.len() {
+            &self.lines[row]
+        } else {
+            ""
+        }
     }
 
     pub fn insert_char(&mut self, row: usize, col: usize, c: char) {
@@ -68,6 +91,9 @@ impl Buffer {
 
     pub fn delete_char(&mut self, row: usize, col: usize) -> bool {
         if col < self.lines[row].len() {
+            if !self.lines[row].is_char_boundary(col) {
+                return false;
+            }
             self.lines[row].remove(col);
             self.modified = true;
             true
@@ -83,7 +109,10 @@ impl Buffer {
 
     pub fn backspace(&mut self, row: usize, col: usize) -> bool {
         if col > 0 {
-            self.lines[row].remove(col - 1);
+            let Some(prev_col) = prev_char_boundary(&self.lines[row], col) else {
+                return false;
+            };
+            self.lines[row].drain(prev_col..col);
             self.modified = true;
             true
         } else if row > 0 {
@@ -127,5 +156,43 @@ impl Buffer {
             .and_then(|p| std::path::Path::new(p).extension())
             .and_then(|e| e.to_str())
             .unwrap_or("")
+    }
+}
+
+fn prev_char_boundary(line: &str, col: usize) -> Option<usize> {
+    if col == 0 || col > line.len() || !line.is_char_boundary(col) {
+        return None;
+    }
+    line[..col].char_indices().last().map(|(idx, _)| idx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_file(name: &str) -> std::path::PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "tinyvim-buffer-{}-{}-{}",
+            std::process::id(),
+            stamp,
+            name
+        ))
+    }
+
+    #[test]
+    fn load_and_save_preserves_trailing_newline() {
+        let path = temp_file("newline.txt");
+        std::fs::write(&path, "hello\n").unwrap();
+
+        let mut buffer = Buffer::load(&path).unwrap();
+        buffer.save().unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
+        let _ = std::fs::remove_file(path);
     }
 }
