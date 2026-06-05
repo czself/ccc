@@ -70,7 +70,12 @@ fn probe_system_compiler(candidates: &[&str]) -> Option<Compiler> {
 
 fn probe_python(candidates: &[&str]) -> Option<Compiler> {
     for name in candidates {
-        let output = Command::new(name).arg("--version").output();
+        if is_windows_python_store_alias(name) {
+            continue;
+        }
+        let output = Command::new(name)
+            .args(["-c", "import sys; sys.exit(0)"])
+            .output();
         if output.as_ref().is_ok_and(|output| output.status.success()) {
             return Some(Compiler::Python {
                 name: name.to_string(),
@@ -78,6 +83,21 @@ fn probe_python(candidates: &[&str]) -> Option<Compiler> {
         }
     }
     None
+}
+
+fn is_windows_python_store_alias(name: &str) -> bool {
+    if !cfg!(target_os = "windows") || !matches!(name, "python" | "python3") {
+        return false;
+    }
+    let Ok(output) = Command::new("where.exe").arg(name).output() else {
+        return false;
+    };
+    let first_path = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    first_path.contains("\\microsoft\\windowsapps\\")
 }
 
 fn uv_dir() -> PathBuf {
@@ -264,6 +284,27 @@ fn find_named_file_in_manual_tool_roots(file_names: &[String]) -> Option<PathBuf
 }
 
 fn download_file(url: &str, dest: &Path) -> io::Result<()> {
+    match download_file_with_ureq(url, dest) {
+        Ok(()) => return Ok(()),
+        Err(ureq_error) if cfg!(target_os = "windows") => {
+            download_file_with_curl(url, dest).map_err(|curl_error| {
+                io::Error::other(format!(
+                    "ureq failed: {}; curl.exe failed: {}",
+                    ureq_error, curl_error
+                ))
+            })?;
+        }
+        Err(e) => return Err(e),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755)).ok();
+    }
+    Ok(())
+}
+
+fn download_file_with_ureq(url: &str, dest: &Path) -> io::Result<()> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(DOWNLOAD_TIMEOUT))
         .build()
@@ -281,6 +322,28 @@ fn download_file(url: &str, dest: &Path) -> io::Result<()> {
         std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755)).ok();
     }
     Ok(())
+}
+
+fn download_file_with_curl(url: &str, dest: &Path) -> io::Result<()> {
+    let mut command = Command::new("curl.exe");
+    command.args([
+        "-L",
+        "--fail",
+        "--max-time",
+        &DOWNLOAD_TIMEOUT.as_secs().to_string(),
+        "-o",
+    ]);
+    command.arg(dest);
+    command.arg(url);
+    let output = run_command_output_timeout(&mut command, DOWNLOAD_TIMEOUT, "download command")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let details = combine_output(&output.stdout, &output.stderr);
+    Err(io::Error::other(format!(
+        "curl.exe exited with {}: {}",
+        output.status, details
+    )))
 }
 
 fn is_windows_access_denied(error: &io::Error) -> bool {
@@ -1069,6 +1132,23 @@ fn compiler_exe(c: &Compiler) -> &Path {
     }
 }
 
+fn configure_compiler_environment(command: &mut Command, compiler: &Compiler) {
+    if let Compiler::W64DevkitCxx { path } = compiler {
+        if let Some(bin_dir) = path.parent() {
+            prepend_path(command, bin_dir);
+        }
+    }
+}
+
+fn prepend_path(command: &mut Command, dir: &Path) {
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![dir.to_path_buf()];
+    paths.extend(std::env::split_paths(&old_path));
+    if let Ok(path) = std::env::join_paths(paths) {
+        command.env("PATH", path);
+    }
+}
+
 fn is_tcc(c: &Compiler) -> bool {
     matches!(c, Compiler::Tcc { .. })
 }
@@ -1273,6 +1353,7 @@ pub fn compile(source_path: &str, compiler: &Compiler) -> io::Result<BuildResult
     for attempt in 1..=attempts {
         let mut command = Command::new(compiler_exe(compiler));
         command.args(&all_flags);
+        configure_compiler_environment(&mut command, compiler);
         let result =
             run_command_output_timeout(&mut command, BUILD_TIMEOUT, "build/check command")?;
         let mut output = combine_output(&result.stdout, &result.stderr);

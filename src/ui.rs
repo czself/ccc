@@ -1077,8 +1077,13 @@ fn render_output_panel(
     if editor.diagnostics.is_empty() {
         let cmd_line = format!("$ {}\n", result.command_line);
         let body = cmd_line + &result.output;
-        let paragraph = Paragraph::new(scrolled_lines(&body, editor.output_scroll, inner.height))
-            .style(Style::default().fg(theme.status_fg));
+        let paragraph = Paragraph::new(scrolled_wrapped_lines(
+            &body,
+            editor.output_scroll,
+            inner.height,
+            inner.width,
+        ))
+        .style(Style::default().fg(theme.status_fg));
         frame.render_widget(paragraph, inner);
         return;
     }
@@ -1130,26 +1135,52 @@ fn render_output_panel(
     let cmd_line = format!("$ {}\n", result.command_line);
     let body = cmd_line + &result.output;
     frame.render_widget(
-        Paragraph::new(scrolled_lines(
+        Paragraph::new(scrolled_wrapped_lines(
             &body,
             editor.output_scroll,
             chunks[1].height,
+            chunks[1].width,
         ))
         .style(Style::default().fg(theme.status_fg)),
         chunks[1],
     );
 }
 
-fn scrolled_lines(text: &str, scroll: usize, height: u16) -> Vec<Line<'static>> {
-    let lines: Vec<&str> = text.lines().collect();
+fn scrolled_wrapped_lines(
+    text: &str,
+    scroll: usize,
+    height: u16,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let lines = wrap_output_lines(text, width as usize);
     let visible = height as usize;
     let max_scroll = lines.len().saturating_sub(visible);
     let start = scroll.min(max_scroll);
-    lines
-        .into_iter()
-        .skip(start)
-        .map(|line| Line::from(line.to_string()))
-        .collect()
+    lines.into_iter().skip(start).collect()
+}
+
+fn wrap_output_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut wrapped = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            wrapped.push(Line::from(""));
+            continue;
+        }
+        let mut current = String::new();
+        let mut current_width = 0usize;
+        for ch in line.chars() {
+            let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if current_width > 0 && current_width + ch_width > width {
+                wrapped.push(Line::from(std::mem::take(&mut current)));
+                current_width = 0;
+            }
+            current.push(ch);
+            current_width += ch_width;
+        }
+        wrapped.push(Line::from(current));
+    }
+    wrapped
 }
 
 fn render_help_panel(frame: &mut Frame, area: Rect) {
