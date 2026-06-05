@@ -817,14 +817,8 @@ fn render_status_bar(frame: &mut Frame, area: Rect, editor: &Editor, theme: &The
             .line_char_count(editor.cursor_row, editor.cursor_col)
             + 1
     );
-    let has_runner = editor.compiler_info.cc.is_some()
-        || editor.compiler_info.cxx.is_some()
-        || editor.compiler_info.python.is_some();
-    let hint = if has_runner {
-        " F1帮助  F2 AI配置  ^S保存  ^E AI改  ^R AI聊  ^Z回退  ^O打开  ^N新建  F5检查  F6运行 "
-    } else {
-        " F1帮助  F2 AI配置  ^S保存  ^E AI改  ^R AI聊  ^Z回退  ^O打开  ^N新建  [无编译器/Python] "
-    };
+    let hint =
+        " F1帮助  F2 AI配置  ^S保存  ^E AI改  ^R AI聊  ^Z回退  ^O打开  ^N新建  F5检查  F6运行 ";
 
     let status_style = Style::default().bg(theme.status_bg).fg(theme.status_fg);
 
@@ -833,9 +827,12 @@ fn render_status_bar(frame: &mut Frame, area: Rect, editor: &Editor, theme: &The
     } else {
         format!("  Problems {}", editor.diagnostics.len())
     };
+    let message = editor
+        .active_task_status()
+        .unwrap_or_else(|| editor.message.clone());
     let full = format!(
         " {} {} {}  {}{}  {}",
-        filename, modified, pos, hint, diag, editor.message
+        filename, modified, pos, hint, diag, message
     );
     let paragraph = Paragraph::new(full).style(status_style);
     frame.render_widget(paragraph, area);
@@ -1159,7 +1156,7 @@ fn render_help_panel(frame: &mut Frame, area: Rect) {
     let block = Block::default()
         .borders(Borders::TOP)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(" 功能帮助 (F1关闭) ")
+        .title(" 帮助  F1关闭 ")
         .title_style(
             Style::default()
                 .fg(Color::Cyan)
@@ -1169,68 +1166,106 @@ fn render_help_panel(frame: &mut Frame, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(&block, area);
 
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(inner);
+    if inner.width >= 96 {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(34),
+                Constraint::Percentage(33),
+                Constraint::Percentage(33),
+            ])
+            .split(inner);
+        for (area, lines) in columns.iter().zip(help_columns()) {
+            render_help_column(frame, *area, lines);
+        }
+    } else {
+        render_help_column(frame, inner, compact_help_lines());
+    }
+}
 
-    let left_help = vec![
-        Line::from(vec![Span::styled(
-            "文件与编辑:",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )]),
-        Line::from("  ^S保存/自动检查  ^O打开  ^N新建  ^Q退出"),
-        Line::from("  方向键/Home/End/PageUp/PageDown/鼠标滚轮 移动  Alt+h/l 按词移动"),
-        Line::from("  Enter换行  Tab缩进  Backspace/Delete删除  ^Z回退"),
-        Line::from("  当前行高亮  括号匹配高亮"),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "选择、复制与搜索:",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )]),
-        Line::from("  ^A全选  ^X剪切  ^C复制  ^V粘贴"),
-        Line::from("  ^F搜索  F3下一个  Shift+F3上一个  搜索结果高亮"),
-        Line::from("  输出/AI预览可用 PageUp/PageDown 或鼠标滚轮翻页"),
-    ];
-
-    let right_help = vec![
-        Line::from(vec![Span::styled(
-            "代码与检查:",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )]),
-        Line::from("  自动补全  Ctrl+Space手动触发  Tab/Enter接受"),
-        Line::from("  F2重新配置 AI 地址/模型/Key"),
-        Line::from("  ^E AI修改/预览后 y/n 确认  ^R AI连续聊天"),
-        Line::from("  Chat/Edit 都会记住本次运行会话；Esc退出 AI 输入"),
-        Line::from("  F5编译/检查  F6编译并运行  保存后自动检查"),
-        Line::from("  Problems错误列表  点击错误跳转  F8/Shift+F8 下/上一个错误"),
-        Line::from("  红色错误标记/下划线  错误行自动定位"),
-        Line::from("  无编译器/Python时自动下载 TCC/w64devkit/Zig/uv"),
-        Line::from("  下载失败会打开URL/缓存目录；放入提示文件后重试"),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "其他:",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )]),
-        Line::from("  F1显示/关闭帮助  Esc关闭对话框/取消操作"),
-    ];
-
-    let left = Paragraph::new(left_help)
+fn render_help_column(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
+    let paragraph = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .style(Style::default().fg(Color::White));
-    let right = Paragraph::new(right_help)
-        .wrap(Wrap { trim: false })
-        .style(Style::default().fg(Color::White));
-    frame.render_widget(left, columns[0]);
-    frame.render_widget(right, columns[1]);
+    frame.render_widget(paragraph, area);
+}
+
+fn help_columns() -> Vec<Vec<Line<'static>>> {
+    vec![
+        vec![
+            help_heading("文件 / 编辑"),
+            help_row("^S", "保存并自动检查"),
+            help_row("^O", "打开文件"),
+            help_row("^N", "新建文件"),
+            help_row("^Q", "退出"),
+            help_row("^Z", "回退"),
+            help_row("^A", "全选"),
+            help_row("^X/^C/^V", "剪切 / 复制 / 粘贴"),
+            help_row("Tab / Enter", "缩进或接受补全 / 换行"),
+            help_row("Alt+h/l", "按词左移 / 右移"),
+        ],
+        vec![
+            help_heading("搜索 / 诊断"),
+            help_row("^F", "搜索"),
+            help_row("F3", "下一个搜索结果"),
+            help_row("Shift+F3", "上一个搜索结果"),
+            help_row("^Space", "手动触发补全"),
+            help_row("F5", "检查 / 编译"),
+            help_row("F6", "编译并运行"),
+            help_row("F8 / Shift+F8", "下一个 / 上一个错误"),
+            help_row("Problems", "点击错误跳到行列"),
+            help_row("PgUp/PgDn", "输出和 AI 预览翻页"),
+        ],
+        vec![
+            help_heading("AI / 其他"),
+            help_row("^R", "AI 聊天"),
+            help_row("^E", "AI 修改当前文件"),
+            help_row("F2", "配置 AI 地址 / 模型 / Key"),
+            help_row("y / n", "应用 / 放弃 AI 修改"),
+            help_row("Esc", "关闭面板或退出输入"),
+            help_row("F1", "关闭帮助"),
+            help_row("保存后", "自动检查当前文件"),
+            help_row("运行输入", "支持 cin / scanf / input()"),
+            help_row("缺工具", "自动下载 TCC / w64devkit / Zig / uv"),
+        ],
+    ]
+}
+
+fn compact_help_lines() -> Vec<Line<'static>> {
+    vec![
+        help_heading("常用快捷键"),
+        help_row("^S / ^O / ^N / ^Q", "保存 / 打开 / 新建 / 退出"),
+        help_row("^Z / ^A", "回退 / 全选"),
+        help_row("^X / ^C / ^V", "剪切 / 复制 / 粘贴"),
+        help_row("^F / F3 / Shift+F3", "搜索 / 下一个 / 上一个"),
+        help_row("^Space / Tab", "补全 / 接受补全或缩进"),
+        help_row("F5 / F6", "检查编译 / 运行"),
+        help_row("F8 / Shift+F8", "下一个 / 上一个错误"),
+        help_row("^R / ^E / F2", "AI 聊天 / AI 修改 / AI 配置"),
+        help_row("PgUp/PgDn / Esc", "面板翻页 / 关闭面板"),
+    ]
+}
+
+fn help_heading(title: &'static str) -> Line<'static> {
+    Line::from(vec![Span::styled(
+        format!("  {}", title),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )])
+}
+
+fn help_row(key: &'static str, desc: &'static str) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("{:<15}", key),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(desc),
+    ])
 }
 
 #[cfg(test)]

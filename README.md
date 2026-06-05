@@ -24,6 +24,21 @@
 ./tinyvim
 ```
 
+Windows 推荐用 Windows Terminal 打开，并优先运行随 release 提供的启动脚本，它会先切换 UTF-8，减少中文乱码和终端兼容问题：
+
+```bat
+tinyvim-windows.cmd hello.c
+tinyvim-windows.cmd hello.cpp
+tinyvim-windows.cmd hello.py
+```
+
+如果必须直接运行 exe，请先在 cmd 里执行：
+
+```bat
+chcp 65001
+tinyvim-x86_64-windows.exe hello.c
+```
+
 ### 快捷键
 
 | 按键 | 功能 |
@@ -124,7 +139,9 @@ set TINYVIM_AI_MODEL=deepseek-v4-flash
 ## 编译原理
 
 - 优先使用系统编译器（gcc/clang/MSVC）
-- C 文件无系统编译器时，自动下载 **TCC**（~150KB）到缓存目录
+- C 文件无系统编译器时：
+  - **Windows** → 自动下载 **TCC**（体积小，适合 tinyvim 定位）
+  - **Linux/macOS** → 自动下载 **Zig**，使用 `zig cc` 编译单文件 C
 - C++ 文件无系统编译器时：
   - **Windows** → 自动下载 **w64devkit**（便携 MinGW，约 70MB）
   - **Linux/macOS** → 自动下载 **Zig**，使用 `zig c++` 编译单文件 C++
@@ -138,11 +155,11 @@ set TINYVIM_AI_MODEL=deepseek-v4-flash
   - `TINYVIM_W64DEVKIT_URL`
   - `TINYVIM_ZIG_URL`
   - `TINYVIM_UV_URL`
-- 没有网络或下载地址不可访问时，TinyVim 会尝试自动打开下载地址和缓存目录；底部 Output 会显示失败 URL、文件应放置的位置和可覆盖的镜像变量名。下载后把文件放到提示路径，再按 `F5` / `F6` 重试：
-  - TCC Windows: `tcc.zip`
-  - w64devkit Windows: `w64devkit.zip`
-  - Zig Linux/macOS: `zig.tar.xz`
-  - uv: `uv-install.ps1` / `uv-install.sh`，也可以直接放 `uv.exe` / `uv`
+- 没有网络或下载地址不可访问时，TinyVim 会尝试自动打开下载地址和缓存目录；底部 Output 会显示失败 URL、缓存目录和可覆盖的镜像变量名。下载后可以把压缩包或解压后的目录放到缓存目录、系统 `Downloads`、TinyVim 同目录或当前项目目录，再按 `F5` / `F6` 重试：
+  - TCC Windows: `tcc.zip` / `tcc-0.9.27-win64-bin.zip`，或已解压出的 `tcc.exe`
+  - w64devkit Windows: `w64devkit.zip` / `w64devkit-*.zip`，或已解压出的 `w64devkit/**/g++.exe`
+  - Zig Linux/macOS: `zig.tar.xz` / `zig-*.tar.xz`，或已解压出的 `zig`
+  - uv: `uv.zip` / `uv.tar.gz` / 官方 `uv-*` 压缩包，或已解压出的 `uv.exe` / `uv`
 - `F6` 运行时会临时回到真实终端，C/C++ 的 `cin` / `scanf` 和 Python 的 `input()` 都可以交互输入；程序结束后按 `Enter` 回到 TinyVim
 
 ## 自行编译

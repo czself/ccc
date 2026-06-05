@@ -62,6 +62,13 @@ struct AiConfig {
     model: String,
 }
 
+#[derive(Clone, Copy)]
+enum AiConfigSource {
+    ConfigFile,
+    TinyvimEnv,
+    OpenAiEnv,
+}
+
 pub fn edit_current_file(request: AiEditRequest<'_>) -> Result<String, String> {
     let mut messages = vec![ChatMessage {
         role: "system".into(),
@@ -120,18 +127,14 @@ fn call_chat_completion(messages: Vec<ChatMessage>) -> Result<String, String> {
 
     let body =
         serde_json::to_string(&body).map_err(|e| format!("AI request build failed: {}", e))?;
-    let mut response = ureq::post(&url)
-        .header("Authorization", &format!("Bearer {}", config.api_key))
-        .header("Content-Type", "application/json")
-        .send(body)
-        .map_err(|e| ai_request_error(&e.to_string()))?;
-
-    let text = response
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| format!("AI response read failed: {}", e))?;
-    let parsed: ChatResponse =
-        serde_json::from_str(&text).map_err(|e| format!("AI response parse failed: {}", e))?;
+    let text = send_chat_request(&url, &config.api_key, body)?;
+    let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
+        format!(
+            "AI response parse failed: {}\nResponse body:\n{}",
+            e,
+            trim_error_body(&text)
+        )
+    })?;
     let content = parsed
         .choices
         .into_iter()
@@ -149,17 +152,64 @@ pub fn has_config() -> bool {
 }
 
 pub fn config_summary() -> Result<String, String> {
-    let config = load_config()
+    let (config, source) = load_config_with_source()
         .ok_or_else(|| "AI is not configured. Press Ctrl+E or Ctrl+R to set it up.".to_string())?;
-    let source = if env_overrides_ai_config() {
-        "environment variables"
-    } else {
-        "config file"
-    };
     Ok(format!(
-        "AI provider: OpenAI-compatible\nSource: {}\nBase URL: {}\nModel: {}\nAPI Key: configured",
-        source, config.base_url, config.model
+        "AI provider: OpenAI-compatible\nSource: {}\nBase URL: {}\nModel: {}\nAPI Key: {}",
+        source.label(),
+        config.base_url,
+        config.model,
+        mask_api_key(&config.api_key)
     ))
+}
+
+pub fn test_current_config() -> Result<String, String> {
+    let (config, source) = load_config_with_source()
+        .ok_or_else(|| "AI is not configured. Press Ctrl+E or Ctrl+R to set it up.".to_string())?;
+    let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
+    let body = ChatRequest {
+        model: config.model.clone(),
+        temperature: 0.0,
+        messages: vec![ChatMessage {
+            role: "user".into(),
+            content: "ping".into(),
+        }],
+    };
+    let body = serde_json::to_string(&body).map_err(|e| format!("AI test build failed: {}", e))?;
+    let _ = send_chat_request(&url, &config.api_key, body)?;
+
+    Ok(format!(
+        "AI config test passed.\nSource: {}\nBase URL: {}\nModel: {}\nAPI Key: {}",
+        source.label(),
+        config.base_url,
+        config.model,
+        mask_api_key(&config.api_key)
+    ))
+}
+
+pub fn is_auth_error_message(message: &str) -> bool {
+    message.starts_with("AI auth failed:")
+}
+
+pub fn auth_error_detail(message: &str) -> String {
+    let config = config_summary().unwrap_or_else(|e| e);
+    let key_hint = load_config()
+        .map(|config| api_key_health_hint(&config.api_key))
+        .unwrap_or_default();
+    let config_path = config_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|e| e);
+    let override_note = if env_overrides_ai_config() {
+        "Environment variables are active and override the saved F2 config.\nUpdate or clear TINYVIM_AI_API_KEY / OPENAI_API_KEY, then try again."
+    } else {
+        "Press F2 to reconfigure Base URL, Model, and API Key.\nThe API Key prompt is hidden; paste the key and press Enter."
+    };
+
+    format!(
+        "{message}\n\nWhat this means:\nHTTP 401/403 means the AI service was reached, but the API key was rejected.\nThis is usually a wrong, revoked, disabled, truncated, or copied-with-spaces key.\n{key_hint}\nCurrent config:\n{config}\nConfig file:\n{config_path}\n\n{override_note}\n\nDeepSeek defaults:\nBase URL: {base_url}\nModel: {model}",
+        base_url = DEFAULT_BASE_URL,
+        model = DEFAULT_MODEL
+    )
 }
 
 fn ai_request_error(error: &str) -> String {
@@ -180,6 +230,65 @@ fn ai_request_error(error: &str) -> String {
     }
 }
 
+fn send_chat_request(url: &str, api_key: &str, body: String) -> Result<String, String> {
+    let mut response = ureq::post(url)
+        .header("Authorization", &format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .send(body)
+        .map_err(|e| ai_request_error(&e.to_string()))?;
+
+    let status = response.status().as_u16();
+    let text = response
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("AI response read failed: {}", e))?;
+
+    if (200..300).contains(&status) {
+        return Ok(text);
+    }
+
+    Err(ai_status_error(status, &text))
+}
+
+fn ai_status_error(status: u16, body: &str) -> String {
+    let body = trim_error_body(body);
+    if status == 401 || status == 403 {
+        if env_overrides_ai_config() {
+            format!(
+                "AI auth failed: HTTP {}.\nServer response:\n{}\n\nAI key comes from environment variables; update or clear TINYVIM_AI_API_KEY/OPENAI_API_KEY.",
+                status, body
+            )
+        } else {
+            format!(
+                "AI auth failed: HTTP {}.\nServer response:\n{}\n\nPress F2 to reconfigure API Key/Base URL/Model.",
+                status, body
+            )
+        }
+    } else {
+        format!(
+            "AI request failed: HTTP {}.\nServer response:\n{}\n\nPress F2 to reconfigure AI.",
+            status, body
+        )
+    }
+}
+
+fn trim_error_body(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return "<empty response body>".to_string();
+    }
+    let mut compact = trimmed.replace("\r\n", "\n");
+    const LIMIT: usize = 1600;
+    if compact.len() > LIMIT {
+        compact.truncate(LIMIT);
+        compact.push_str("\n...<truncated>");
+    }
+    compact
+}
+
 pub fn default_base_url() -> &'static str {
     DEFAULT_BASE_URL
 }
@@ -189,7 +298,7 @@ pub fn default_model() -> &'static str {
 }
 
 pub fn save_config(api_key: &str, base_url: &str, model: &str) -> Result<(), String> {
-    let api_key = api_key.trim();
+    let api_key = normalize_api_key(api_key);
     if api_key.is_empty() {
         return Err("AI API key cannot be empty".to_string());
     }
@@ -202,7 +311,7 @@ pub fn save_config(api_key: &str, base_url: &str, model: &str) -> Result<(), Str
         return Err("AI model cannot be empty".to_string());
     }
     let config = AiConfig {
-        api_key: api_key.to_string(),
+        api_key,
         base_url: base_url.trim_end_matches('/').to_string(),
         model: model.to_string(),
     };
@@ -223,19 +332,33 @@ pub fn env_overrides_ai_config() -> bool {
 }
 
 fn load_config() -> Option<AiConfig> {
-    if let Ok(api_key) =
-        std::env::var("TINYVIM_AI_API_KEY").or_else(|_| std::env::var("OPENAI_API_KEY"))
-    {
+    load_config_with_source().map(|(config, _)| config)
+}
+
+fn load_config_with_source() -> Option<(AiConfig, AiConfigSource)> {
+    if let Ok(api_key) = std::env::var("TINYVIM_AI_API_KEY") {
         return Some(AiConfig {
-            api_key,
+            api_key: normalize_api_key(&api_key),
             base_url: std::env::var("TINYVIM_AI_BASE_URL")
                 .unwrap_or_else(|_| DEFAULT_BASE_URL.into()),
             model: std::env::var("TINYVIM_AI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into()),
-        });
+        })
+        .map(|config| (config, AiConfigSource::TinyvimEnv));
+    }
+    if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
+        return Some(AiConfig {
+            api_key: normalize_api_key(&api_key),
+            base_url: std::env::var("TINYVIM_AI_BASE_URL")
+                .unwrap_or_else(|_| DEFAULT_BASE_URL.into()),
+            model: std::env::var("TINYVIM_AI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into()),
+        })
+        .map(|config| (config, AiConfigSource::OpenAiEnv));
     }
     let path = config_path().ok()?;
     let body = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&body).ok()
+    let mut config: AiConfig = serde_json::from_str(&body).ok()?;
+    config.api_key = normalize_api_key(&config.api_key);
+    Some((config, AiConfigSource::ConfigFile))
 }
 
 fn config_path() -> Result<PathBuf, String> {
@@ -310,9 +433,59 @@ fn strip_code_fence(text: &str) -> &str {
     }
 }
 
+impl AiConfigSource {
+    fn label(self) -> &'static str {
+        match self {
+            AiConfigSource::ConfigFile => "config file",
+            AiConfigSource::TinyvimEnv => "environment variable TINYVIM_AI_API_KEY",
+            AiConfigSource::OpenAiEnv => "environment variable OPENAI_API_KEY",
+        }
+    }
+}
+
+fn normalize_api_key(api_key: &str) -> String {
+    api_key
+        .chars()
+        .filter(|c| !c.is_whitespace() && !c.is_control())
+        .collect()
+}
+
+pub fn api_key_health_hint(api_key: &str) -> String {
+    let key = normalize_api_key(api_key);
+    let len = key.chars().count();
+    if key.starts_with("sk-") && len < 35 {
+        format!(
+            "\nKey length warning: this saved key is only {} chars. DeepSeek sk-* keys are commonly longer; it may have been pasted incompletely.\n",
+            len
+        )
+    } else {
+        String::new()
+    }
+}
+
+fn mask_api_key(api_key: &str) -> String {
+    let key = normalize_api_key(api_key);
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() <= 12 {
+        return "<hidden>".to_string();
+    }
+    let start: String = chars.iter().take(7).collect();
+    let end: String = chars
+        .iter()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{}...{} ({} chars)", start, end, chars.len())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{config_base_dir, strip_code_fence};
+    use super::{
+        api_key_health_hint, config_base_dir, mask_api_key, normalize_api_key, strip_code_fence,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -382,5 +555,24 @@ mod tests {
             ),
             Some(PathBuf::from("/home/me/.config"))
         );
+    }
+
+    #[test]
+    fn normalize_api_key_removes_pasted_whitespace() {
+        assert_eq!(normalize_api_key(" sk-abc\r\n\t123 "), "sk-abc123");
+    }
+
+    #[test]
+    fn mask_api_key_keeps_only_short_prefix_suffix_and_length() {
+        assert_eq!(
+            mask_api_key("sk-abcdefghijklmnopqrstuvwxyz123456"),
+            "sk-abcd...3456 (35 chars)"
+        );
+    }
+
+    #[test]
+    fn api_key_health_hint_warns_about_short_deepseek_key() {
+        assert!(api_key_health_hint("sk-short").contains("only 8 chars"));
+        assert!(api_key_health_hint("sk-abcdefghijklmnopqrstuvwxyz123456").is_empty());
     }
 }

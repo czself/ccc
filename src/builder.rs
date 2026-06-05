@@ -1,20 +1,25 @@
-use std::io::{self, Read};
+use std::io::{self, BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const ZIG_VERSION: &str = "0.15.2";
 const TCC_WIN64_URL: &str =
     "https://download.savannah.gnu.org/releases/tinycc/tcc-0.9.27-win64-bin.zip";
 const W64DEVKIT_URL: &str =
     "https://github.com/skeeto/w64devkit/releases/download/v1.22.0/w64devkit-1.22.0.zip";
-const UV_INSTALL_PS1_URL: &str = "https://astral.sh/uv/install.ps1";
-const UV_INSTALL_SH_URL: &str = "https://astral.sh/uv/install.sh";
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+const BUILD_TIMEOUT: Duration = Duration::from_secs(300);
+const WINDOWS_ACCESS_RETRY_ATTEMPTS: usize = 8;
+const WINDOWS_ACCESS_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 pub enum Compiler {
     System { name: String },
     Msvc { name: String },
     GccWithStdCxx { name: String },
+    ZigCc { path: PathBuf },
     ZigCxx { path: PathBuf },
     Tcc { path: PathBuf },
     W64DevkitCxx { path: PathBuf },
@@ -35,6 +40,7 @@ pub struct InteractiveRun {
     pub display: String,
 }
 
+#[derive(Clone)]
 pub struct CompilerInfo {
     pub cc: Option<Compiler>,
     pub cxx: Option<Compiler>,
@@ -86,6 +92,50 @@ fn uv_exe_path() -> PathBuf {
     })
 }
 
+fn uv_exe_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "uv.exe"
+    } else {
+        "uv"
+    }
+}
+
+fn uv_archive_info() -> Result<(&'static str, &'static str, bool), String> {
+    let (asset, is_zip) = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => ("uv-x86_64-unknown-linux-musl.tar.gz", false),
+        ("linux", "aarch64") => ("uv-aarch64-unknown-linux-musl.tar.gz", false),
+        ("macos", "x86_64") => ("uv-x86_64-apple-darwin.tar.gz", false),
+        ("macos", "aarch64") => ("uv-aarch64-apple-darwin.tar.gz", false),
+        ("windows", "x86_64") => ("uv-x86_64-pc-windows-msvc.zip", true),
+        _ => {
+            return Err(format!(
+                "no bundled uv build for {} {}",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            ))
+        }
+    };
+    let url = match asset {
+        "uv-x86_64-unknown-linux-musl.tar.gz" => {
+            "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-unknown-linux-musl.tar.gz"
+        }
+        "uv-aarch64-unknown-linux-musl.tar.gz" => {
+            "https://github.com/astral-sh/uv/releases/latest/download/uv-aarch64-unknown-linux-musl.tar.gz"
+        }
+        "uv-x86_64-apple-darwin.tar.gz" => {
+            "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-apple-darwin.tar.gz"
+        }
+        "uv-aarch64-apple-darwin.tar.gz" => {
+            "https://github.com/astral-sh/uv/releases/latest/download/uv-aarch64-apple-darwin.tar.gz"
+        }
+        "uv-x86_64-pc-windows-msvc.zip" => {
+            "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip"
+        }
+        _ => unreachable!(),
+    };
+    Ok((url, asset, is_zip))
+}
+
 fn download_uv() -> Result<PathBuf, String> {
     let uv_exe = uv_exe_path();
     if uv_exe.exists() {
@@ -99,50 +149,49 @@ fn download_uv() -> Result<PathBuf, String> {
     std::fs::create_dir_all(&uv_dir)
         .map_err(|e| format!("create uv directory {}: {}", uv_dir.display(), e))?;
 
-    let (default_url, script_name) = if cfg!(target_os = "windows") {
-        (UV_INSTALL_PS1_URL, "uv-install.ps1")
-    } else {
-        (UV_INSTALL_SH_URL, "uv-install.sh")
-    };
+    if let Some(path) = find_file_in_manual_tool_roots(uv_exe_name()) {
+        return Ok(path);
+    }
+
+    let (default_url, archive_name, is_zip) = uv_archive_info()?;
     let url = std::env::var("TINYVIM_UV_URL").unwrap_or_else(|_| default_url.to_string());
-    let script_path = cache.join(script_name);
-    if !script_path.exists() {
-        download_file(&url, &script_path).map_err(|e| {
+    let fallback_archive_name = if is_zip { "uv.zip" } else { "uv.tar.gz" };
+    let archive_names = vec![archive_name.to_string(), fallback_archive_name.to_string()];
+    let archive_path = find_named_file_in_manual_tool_roots(&archive_names)
+        .unwrap_or_else(|| cache.join(fallback_archive_name));
+    if !archive_path.exists() {
+        download_file(&url, &archive_path).map_err(|e| {
             format!(
-                "download {}: {}. {} Manual fallback: download this installer to {}, or put uv executable at {}, or set TINYVIM_UV_URL to a reachable mirror URL, then press F5/F6 again.",
+                "download {}: {}. {} Manual fallback: download this uv archive ({}) to {} or your Downloads folder, or extract it under either folder. TinyVim will search for {} automatically. You can also set TINYVIM_UV_URL to a reachable uv archive URL, then press F5/F6 again.",
                 url,
                 e,
                 download_failure_hint(&url, &cache),
-                script_path.display(),
-                uv_exe.display()
+                archive_name,
+                cache.display(),
+                uv_exe_name()
             )
         })?;
     }
 
-    let status = if cfg!(target_os = "windows") {
-        Command::new("powershell")
-            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-            .arg(&script_path)
-            .env("UV_UNMANAGED_INSTALL", &uv_dir)
-            .status()
-            .map_err(|e| format!("run PowerShell uv installer: {}", e))?
+    if is_zip {
+        unzip_archive(&archive_path, &uv_dir, "uv")?;
     } else {
-        Command::new("sh")
-            .arg(&script_path)
-            .env("UV_UNMANAGED_INSTALL", &uv_dir)
-            .status()
-            .map_err(|e| format!("run uv installer: {}", e))?
-    };
+        untar_gz_archive(&archive_path, &uv_dir, "uv")?;
+    }
 
-    if status.success() && uv_exe.exists() {
-        Ok(uv_exe)
+    if let Some(path) = find_file_in_manual_tool_roots(uv_exe_name()) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).ok();
+        }
+        Ok(path)
     } else {
         Err(format!(
-            "uv installer exited with status {} and {} was not created. Manual fallback: install Python normally, place a working uv installer at {}, or put uv executable directly at {}, then press F5/F6 again.",
-            status,
-            uv_exe.display(),
-            script_path.display(),
-            uv_exe.display()
+            "uv archive extracted, but {} was not found under {}. Manual fallback: put or extract uv under {} or your Downloads folder, then press F5/F6 again.",
+            uv_exe_name(),
+            uv_dir.display(),
+            cache.display(),
         ))
     }
 }
@@ -165,8 +214,62 @@ fn cache_dir() -> PathBuf {
     PathBuf::from(base).join(sub)
 }
 
+fn downloads_dir() -> Option<PathBuf> {
+    let base = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()?;
+    let path = PathBuf::from(base).join("Downloads");
+    path.exists().then_some(path)
+}
+
+fn manual_tool_roots() -> Vec<(PathBuf, usize)> {
+    let cache = cache_dir();
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+    let cwd = std::env::current_dir().ok();
+
+    let mut roots = Vec::new();
+    push_manual_tool_root(&mut roots, Some(cache), usize::MAX);
+    push_manual_tool_root(&mut roots, downloads_dir(), 4);
+    push_manual_tool_root(&mut roots, exe_dir, 4);
+    push_manual_tool_root(&mut roots, cwd, 4);
+    roots
+}
+
+fn push_manual_tool_root(
+    roots: &mut Vec<(PathBuf, usize)>,
+    path: Option<PathBuf>,
+    max_depth: usize,
+) {
+    let Some(path) = path.filter(|path| path.exists()) else {
+        return;
+    };
+    if !roots.iter().any(|(existing, _)| existing == &path) {
+        roots.push((path, max_depth));
+    }
+}
+
+fn find_file_in_manual_tool_roots(file_name: &str) -> Option<PathBuf> {
+    find_named_file_in_manual_tool_roots(&[file_name.to_string()])
+}
+
+fn find_named_file_in_manual_tool_roots(file_names: &[String]) -> Option<PathBuf> {
+    for (root, max_depth) in manual_tool_roots() {
+        if let Some(path) = find_named_file_recursive_with_depth(&root, file_names, max_depth) {
+            return Some(path);
+        }
+    }
+    None
+}
+
 fn download_file(url: &str, dest: &Path) -> io::Result<()> {
-    let resp = ureq::get(url)
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(DOWNLOAD_TIMEOUT))
+        .build()
+        .into();
+    let resp = agent
+        .get(url)
         .call()
         .map_err(|e| io::Error::other(format!("HTTP: {}", e)))?;
     let mut body: Vec<u8> = Vec::new();
@@ -178,6 +281,91 @@ fn download_file(url: &str, dest: &Path) -> io::Result<()> {
         std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755)).ok();
     }
     Ok(())
+}
+
+fn is_windows_access_denied(error: &io::Error) -> bool {
+    cfg!(target_os = "windows")
+        && (error.kind() == io::ErrorKind::PermissionDenied || error.raw_os_error() == Some(5))
+}
+
+fn output_mentions_access_denied(output: &str) -> bool {
+    if !cfg!(target_os = "windows") {
+        return false;
+    }
+    let lower = output.to_lowercase();
+    lower.contains("access is denied")
+        || lower.contains("permission denied")
+        || lower.contains("拒绝访问")
+}
+
+fn windows_access_denied_hint(program: &Path, label: &str, error: &io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!(
+            "Windows denied access while starting {} ({}) after retrying. Original error: {}. This is usually Windows Defender/antivirus scanning a freshly downloaded tool or the previous run still locking the exe. Wait a moment, close any still-running program window, or allow TinyVim/cache/project folders in Windows Security, then try again.",
+            label,
+            program.display(),
+            error
+        ),
+    )
+}
+
+fn spawn_with_windows_access_retry(command: &mut Command, label: &str) -> io::Result<Child> {
+    let program = Path::new(command.get_program()).to_path_buf();
+    let mut last_error = None;
+
+    for attempt in 1..=WINDOWS_ACCESS_RETRY_ATTEMPTS {
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(e) if is_windows_access_denied(&e) && attempt < WINDOWS_ACCESS_RETRY_ATTEMPTS => {
+                last_error = Some(e);
+                thread::sleep(WINDOWS_ACCESS_RETRY_DELAY);
+            }
+            Err(e) if is_windows_access_denied(&e) => {
+                return Err(windows_access_denied_hint(&program, label, &e));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(windows_access_denied_hint(
+        &program,
+        label,
+        &last_error.unwrap_or_else(|| io::Error::from(io::ErrorKind::PermissionDenied)),
+    ))
+}
+
+fn run_command_output_timeout(
+    command: &mut Command,
+    timeout: Duration,
+    label: &str,
+) -> io::Result<Output> {
+    command
+        .env("PYTHONUTF8", "1")
+        .env("PYTHONIOENCODING", "utf-8");
+    let mut child = spawn_with_windows_access_retry(
+        command.stdout(Stdio::piped()).stderr(Stdio::piped()),
+        label,
+    )?;
+    let start = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output();
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "{} timed out after {} seconds. Check whether the compiler/Python process is stuck, then try again. If this is first-time setup on a clean machine, install the tool manually or put the downloaded tool in TinyVim's cache path shown in Output.",
+                    label,
+                    timeout.as_secs()
+                ),
+            ));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn try_open_url(url: &str) -> bool {
@@ -250,30 +438,40 @@ fn unzip_archive(zip_path: &Path, out_dir: &Path, label: &str) -> Result<(), Str
     Ok(())
 }
 
+fn untar_xz_archive(archive_path: &Path, out_dir: &Path, label: &str) -> Result<(), String> {
+    let file = std::fs::File::open(archive_path)
+        .map_err(|e| format!("open downloaded archive {}: {}", archive_path.display(), e))?;
+    let mut reader = BufReader::new(file);
+    let mut tar_bytes = Vec::new();
+    lzma_rs::xz_decompress(&mut reader, &mut tar_bytes)
+        .map_err(|e| format!("decompress {} xz archive: {}", label, e))?;
+    let mut archive = tar::Archive::new(Cursor::new(tar_bytes));
+    archive
+        .unpack(out_dir)
+        .map_err(|e| format!("extract {} archive to {}: {}", label, out_dir.display(), e))
+}
+
+fn untar_gz_archive(archive_path: &Path, out_dir: &Path, label: &str) -> Result<(), String> {
+    let file = std::fs::File::open(archive_path)
+        .map_err(|e| format!("open downloaded archive {}: {}", archive_path.display(), e))?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    archive
+        .unpack(out_dir)
+        .map_err(|e| format!("extract {} archive to {}: {}", label, out_dir.display(), e))
+}
+
 fn download_tcc() -> Result<PathBuf, String> {
     let cache = cache_dir();
     let (default_url, exe_name, is_zip) = match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("linux", "x86_64") => (
-            "https://github.com/sz3/tinycc/releases/download/v0.9.27/tcc-x86_64-linux",
-            "tcc",
-            false,
-        ),
-        ("linux", "aarch64") => (
-            "https://github.com/sz3/tinycc/releases/download/v0.9.27/tcc-aarch64-linux",
-            "tcc",
-            false,
-        ),
-        ("macos", "x86_64") => (
-            "https://github.com/sz3/tinycc/releases/download/v0.9.27/tcc-x86_64-macos",
-            "tcc",
-            false,
-        ),
-        ("macos", "aarch64") => (
-            "https://github.com/sz3/tinycc/releases/download/v0.9.27/tcc-aarch64-macos",
-            "tcc",
-            false,
-        ),
         ("windows", "x86_64") => (TCC_WIN64_URL, "tcc.exe", true),
+        ("linux" | "macos", _) if std::env::var("TINYVIM_TCC_URL").is_ok() => ("", "tcc", false),
+        ("linux" | "macos", _) => {
+            return Err(
+                "no built-in TCC binary URL for this platform; TinyVim will try Zig cc instead"
+                    .to_string(),
+            )
+        }
         _ => {
             return Err(format!(
                 "no bundled TCC build for {} {}",
@@ -286,28 +484,37 @@ fn download_tcc() -> Result<PathBuf, String> {
 
     std::fs::create_dir_all(&cache)
         .map_err(|e| format!("create cache directory {}: {}", cache.display(), e))?;
-    if let Some(path) = find_file_recursive(&cache, exe_name) {
+    if let Some(path) = find_file_in_manual_tool_roots(exe_name) {
         return Ok(path);
     }
 
     if is_zip {
-        let zip_path = cache.join("tcc.zip");
+        let fallback_archive_name = "tcc.zip";
+        let archive_names = vec![
+            url_file_name(&url).unwrap_or_else(|| "tcc-0.9.27-win64-bin.zip".to_string()),
+            fallback_archive_name.to_string(),
+        ];
+        let zip_path = find_named_file_in_manual_tool_roots(&archive_names)
+            .unwrap_or_else(|| cache.join(fallback_archive_name));
         if !zip_path.exists() {
             download_file(&url, &zip_path).map_err(|e| {
                 format!(
-                    "download {}: {}. {} Manual fallback: download this TCC package to {}, or set TINYVIM_TCC_URL to a reachable mirror URL, then press F5/F6 again.",
+                    "download {}: {}. {} Manual fallback: download this TCC package to {} or your Downloads folder, or extract it under either folder. TinyVim will search for {} automatically. You can also set TINYVIM_TCC_URL to a reachable mirror URL, then press F5/F6 again.",
                     url,
                     e,
                     download_failure_hint(&url, &cache),
-                    zip_path.display()
+                    cache.display(),
+                    exe_name
                 )
             })?;
         }
         unzip_archive(&zip_path, &cache, "TCC")?;
-        std::fs::remove_file(&zip_path).ok();
-        find_file_recursive(&cache, exe_name).ok_or_else(|| {
+        if zip_path.starts_with(&cache) {
+            std::fs::remove_file(&zip_path).ok();
+        }
+        find_file_in_manual_tool_roots(exe_name).ok_or_else(|| {
             format!(
-                "TCC extracted, but {} was not found under {}",
+                "TCC extracted, but {} was not found under {} or your Downloads folder",
                 exe_name,
                 cache.display()
             )
@@ -328,31 +535,87 @@ fn download_tcc() -> Result<PathBuf, String> {
 }
 
 fn cached_tcc() -> Option<PathBuf> {
-    let cache = cache_dir();
     let exe_name = if cfg!(target_os = "windows") {
         "tcc.exe"
     } else {
         "tcc"
     };
-    find_file_recursive(&cache, exe_name)
+    find_file_in_manual_tool_roots(exe_name)
 }
 
-fn find_file_recursive(root: &Path, file_name: &str) -> Option<PathBuf> {
+fn find_named_file_recursive_with_depth(
+    root: &Path,
+    file_names: &[String],
+    max_depth: usize,
+) -> Option<PathBuf> {
     for entry in std::fs::read_dir(root).ok()?.flatten() {
         let path = entry.path();
-        if path.is_dir() {
-            if let Some(found) = find_file_recursive(&path, file_name) {
-                return Some(found);
-            }
-        } else if path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.eq_ignore_ascii_case(file_name))
+        if path.is_file()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    file_names
+                        .iter()
+                        .any(|candidate| file_name_matches_candidate(name, candidate))
+                })
         {
             return Some(path);
         }
+        if max_depth > 0 && path.is_dir() {
+            if let Some(found) =
+                find_named_file_recursive_with_depth(&path, file_names, max_depth - 1)
+            {
+                return Some(found);
+            }
+        }
     }
     None
+}
+
+fn file_name_matches_candidate(name: &str, candidate: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    let candidate = candidate.to_ascii_lowercase();
+    if name == candidate {
+        return true;
+    }
+
+    let Some(suffix) = archive_or_file_suffix(&candidate) else {
+        return false;
+    };
+    let Some(stem) = candidate.strip_suffix(&suffix) else {
+        return false;
+    };
+    let Some(middle) = name
+        .strip_prefix(stem)
+        .and_then(|rest| rest.strip_suffix(&suffix))
+    else {
+        return false;
+    };
+    let middle = middle.trim();
+    middle.is_empty()
+        || (middle.starts_with('(') && middle.ends_with(')'))
+        || (middle.starts_with("-copy") || middle.starts_with("_copy"))
+}
+
+fn archive_or_file_suffix(name: &str) -> Option<String> {
+    [".tar.gz", ".tar.xz", ".zip", ".exe"]
+        .into_iter()
+        .find(|suffix| name.ends_with(suffix))
+        .map(ToString::to_string)
+        .or_else(|| {
+            Path::new(name)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| format!(".{}", ext.to_ascii_lowercase()))
+        })
+}
+
+fn url_file_name(url: &str) -> Option<String> {
+    url.rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .map(ToString::to_string)
 }
 
 fn cached_mingw_gpp(cache: &Path) -> Option<PathBuf> {
@@ -360,14 +623,32 @@ fn cached_mingw_gpp(cache: &Path) -> Option<PathBuf> {
     if direct.exists() {
         return Some(direct);
     }
-    find_file_recursive(cache, "g++.exe").filter(|path| {
-        path.components().any(|component| {
-            component
-                .as_os_str()
-                .to_string_lossy()
-                .contains("w64devkit")
-        })
-    })
+    for (root, max_depth) in manual_tool_roots() {
+        if let Some(path) =
+            find_named_file_recursive_with_depth(&root, &["g++.exe".to_string()], max_depth).filter(
+                |path| {
+                    path.components().any(|component| {
+                        component
+                            .as_os_str()
+                            .to_string_lossy()
+                            .to_ascii_lowercase()
+                            .contains("w64devkit")
+                    })
+                },
+            )
+        {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn find_mingw_archive() -> Option<PathBuf> {
+    let mut archive_names = vec!["w64devkit.zip".to_string()];
+    if let Some(default_name) = url_file_name(W64DEVKIT_URL) {
+        archive_names.push(default_name);
+    }
+    find_named_file_in_manual_tool_roots(&archive_names)
 }
 
 fn download_mingw() -> Result<PathBuf, String> {
@@ -382,25 +663,27 @@ fn download_mingw() -> Result<PathBuf, String> {
 
     let zip_url =
         std::env::var("TINYVIM_W64DEVKIT_URL").unwrap_or_else(|_| W64DEVKIT_URL.to_string());
-    let zip_path = cache.join("w64devkit.zip");
+    let zip_path = find_mingw_archive().unwrap_or_else(|| cache.join("w64devkit.zip"));
 
     if !zip_path.exists() {
         download_file(&zip_url, &zip_path).map_err(|e| {
             format!(
-                "download {}: {}. {} Manual fallback: download this w64devkit zip to {}, or set TINYVIM_W64DEVKIT_URL to a reachable mirror URL, then press F5/F6 again.",
+                "download {}: {}. {} Manual fallback: download this w64devkit zip to {} or your Downloads folder, or extract it under either folder. TinyVim will search for g++.exe automatically. You can also set TINYVIM_W64DEVKIT_URL to a reachable mirror URL, then press F5/F6 again.",
                 zip_url,
                 e,
                 download_failure_hint(&zip_url, &cache),
-                zip_path.display()
+                cache.display()
             )
         })?;
     }
 
     unzip_archive(&zip_path, &cache, "w64devkit")?;
-    std::fs::remove_file(&zip_path).ok();
+    if zip_path.starts_with(&cache) {
+        std::fs::remove_file(&zip_path).ok();
+    }
     cached_mingw_gpp(&cache).ok_or_else(|| {
         format!(
-            "w64devkit extracted, but g++.exe was not found under {}",
+            "w64devkit extracted, but g++.exe was not found under {} or your Downloads folder",
             cache.display()
         )
     })
@@ -431,10 +714,11 @@ fn find_cached_zig() -> Option<PathBuf> {
     if expected.exists() {
         return Some(expected);
     }
-    for entry in std::fs::read_dir(&root).ok()?.flatten() {
-        let candidate = entry.path().join("zig");
-        if candidate.exists() {
-            return Some(candidate);
+    for (root, max_depth) in manual_tool_roots() {
+        if let Some(path) =
+            find_named_file_recursive_with_depth(&root, &["zig".to_string()], max_depth)
+        {
+            return Some(path);
         }
     }
     None
@@ -463,43 +747,29 @@ fn download_zig() -> Result<PathBuf, String> {
         ZIG_VERSION, archive_stem
     );
     let url = std::env::var("TINYVIM_ZIG_URL").unwrap_or(default_url);
-    let archive_path = cache.join("zig.tar.xz");
+    let archive_names = vec![
+        url_file_name(&url).unwrap_or_else(|| format!("{}.tar.xz", archive_stem)),
+        "zig.tar.xz".to_string(),
+    ];
+    let archive_path = find_named_file_in_manual_tool_roots(&archive_names)
+        .unwrap_or_else(|| cache.join("zig.tar.xz"));
     if !archive_path.exists() {
         download_file(&url, &archive_path).map_err(|e| {
             format!(
-                "download {}: {}. {} Manual fallback: download this Zig archive to {}, or set TINYVIM_ZIG_URL to a reachable mirror URL, then press F5/F6 again.",
+                "download {}: {}. {} Manual fallback: download this Zig archive to {} or your Downloads folder, or extract it under either folder. TinyVim will search for zig automatically. You can also set TINYVIM_ZIG_URL to a reachable mirror URL, then press F5/F6 again.",
                 url,
                 e,
                 download_failure_hint(&url, &cache),
-                archive_path.display()
+                cache.display()
             )
         })?;
     }
 
-    let status = Command::new("tar")
-        .args(["-xJf"])
-        .arg(&archive_path)
-        .arg("-C")
-        .arg(&cache)
-        .status()
-        .map_err(|e| {
-            format!(
-                "run tar to extract Zig archive {}: {}",
-                archive_path.display(),
-                e
-            )
-        })?;
-    if !status.success() {
-        return Err(format!(
-            "extract Zig archive {} failed with status {}",
-            archive_path.display(),
-            status
-        ));
-    }
+    untar_xz_archive(&archive_path, &cache, "Zig")?;
 
     let zig = find_cached_zig().ok_or_else(|| {
         format!(
-            "Zig extracted, but zig executable was not found under {}",
+            "Zig extracted, but zig executable was not found under {} or your Downloads folder",
             cache.display()
         )
     })?;
@@ -534,8 +804,8 @@ fn resolve_compiler_with_download(
 
     // Check cached info first
     let from_info = match ext {
-        "c" => info.cc.clone(),
-        "cpp" | "cc" | "cxx" | "c++" => info.cxx.clone(),
+        "c" | "h" => info.cc.clone(),
+        "cpp" | "cc" | "cxx" | "c++" | "hh" | "hpp" | "hxx" => info.cxx.clone(),
         "py" | "pyw" => info.python.clone(),
         "" => {
             return (
@@ -552,7 +822,7 @@ fn resolve_compiler_with_download(
     let mut download_error = None;
 
     match ext {
-        "c" => {
+        "c" | "h" => {
             if let Some(c) = probe_system_compiler(c_cands) {
                 return (Some(c), None);
             }
@@ -560,7 +830,7 @@ fn resolve_compiler_with_download(
                 return (Some(Compiler::Tcc { path }), None);
             }
         }
-        "cpp" | "cc" | "cxx" | "c++" => {
+        "cpp" | "cc" | "cxx" | "c++" | "hh" | "hpp" | "hxx" => {
             // First try dedicated C++ compilers
             if let Some(c) = probe_system_compiler(cxx_cands) {
                 return (Some(c), None);
@@ -615,14 +885,32 @@ fn resolve_compiler_with_download(
 
     // Auto-download fallback. Startup probing passes allow_download=false, so
     // network work only happens when the user actually builds or runs.
-    if allow_download && ext == "c" {
-        match download_tcc() {
-            Ok(path) => return (Some(Compiler::Tcc { path }), None),
-            Err(e) => download_error = Some(e),
+    if allow_download && matches!(ext, "c" | "h") {
+        if cfg!(target_os = "windows") {
+            match download_tcc() {
+                Ok(path) => return (Some(Compiler::Tcc { path }), None),
+                Err(e) => download_error = Some(e),
+            }
+        } else {
+            let tcc_error = match download_tcc() {
+                Ok(path) => return (Some(Compiler::Tcc { path }), None),
+                Err(e) => e,
+            };
+            match download_zig() {
+                Ok(path) => return (Some(Compiler::ZigCc { path }), None),
+                Err(e) => {
+                    download_error = Some(format!(
+                        "TCC fallback failed: {}; Zig cc fallback failed: {}",
+                        tcc_error, e
+                    ));
+                }
+            }
         }
     }
 
-    if allow_download && cfg!(target_os = "windows") && matches!(ext, "cpp" | "cc" | "cxx" | "c++")
+    if allow_download
+        && cfg!(target_os = "windows")
+        && matches!(ext, "cpp" | "cc" | "cxx" | "c++" | "hh" | "hpp" | "hxx")
     {
         match download_mingw() {
             Ok(path) => return (Some(Compiler::W64DevkitCxx { path }), None),
@@ -630,7 +918,9 @@ fn resolve_compiler_with_download(
         }
     }
 
-    if allow_download && !cfg!(target_os = "windows") && matches!(ext, "cpp" | "cc" | "cxx" | "c++")
+    if allow_download
+        && !cfg!(target_os = "windows")
+        && matches!(ext, "cpp" | "cc" | "cxx" | "c++" | "hh" | "hpp" | "hxx")
     {
         match download_zig() {
             Ok(path) => return (Some(Compiler::ZigCxx { path }), None),
@@ -639,7 +929,7 @@ fn resolve_compiler_with_download(
     }
 
     let hint = match (ext, std::env::consts::OS) {
-        ("py", os) => {
+        ("py" | "pyw", os) => {
             if let Some(error) = download_error {
                 return (
                     None,
@@ -657,16 +947,22 @@ fn resolve_compiler_with_download(
                 _ => "No Python interpreter found.",
             }
         }
-        ("c", os) => {
+        ("c" | "h", os) => {
             if let Some(error) = download_error {
-                return (
-                    None,
-                    Some(format!(
+                let message = if cfg!(target_os = "windows") {
+                    format!(
                         "No C compiler, and automatic TCC download failed: {}. Install gcc/clang/MSVC, put the TCC package/executable in the shown cache path, or set TINYVIM_TCC_URL to a reachable TCC package. Cache: {}",
                         error,
                         cache_dir().display()
-                    )),
-                );
+                    )
+                } else {
+                    format!(
+                        "No C compiler, and automatic Zig cc fallback failed: {}. Install gcc/clang, put zig.tar.xz in the shown cache path, or set TINYVIM_ZIG_URL to a reachable Zig archive. Cache: {}",
+                        error,
+                        zig_dir().display()
+                    )
+                };
+                return (None, Some(message));
             }
             match os {
                 "linux" => "No C compiler. Install: sudo apt install gcc | sudo dnf install gcc | sudo pacman -S gcc",
@@ -675,7 +971,7 @@ fn resolve_compiler_with_download(
                 _ => "No C compiler found.",
             }
         }
-        (_, "linux") => {
+        ("cpp" | "cc" | "cxx" | "c++" | "hh" | "hpp" | "hxx", "linux") => {
             if let Some(error) = download_error {
                 return (
                     None,
@@ -688,7 +984,7 @@ fn resolve_compiler_with_download(
             }
             "No C++ compiler. Install: sudo apt install g++ | sudo dnf install gcc-c++ | sudo pacman -S gcc"
         }
-        (_, "macos") => {
+        ("cpp" | "cc" | "cxx" | "c++" | "hh" | "hpp" | "hxx", "macos") => {
             if let Some(error) = download_error {
                 return (
                     None,
@@ -701,7 +997,7 @@ fn resolve_compiler_with_download(
             }
             "No C++ compiler. Install: xcode-select --install | brew install gcc"
         }
-        (_, "windows") => {
+        ("cpp" | "cc" | "cxx" | "c++" | "hh" | "hpp" | "hxx", "windows") => {
             if let Some(error) = download_error {
                 return (
                     None,
@@ -764,6 +1060,7 @@ fn compiler_exe(c: &Compiler) -> &Path {
         Compiler::System { name } => Path::new(name),
         Compiler::Msvc { name } => Path::new(name),
         Compiler::GccWithStdCxx { name } => Path::new(name),
+        Compiler::ZigCc { path } => path.as_path(),
         Compiler::ZigCxx { path } => path.as_path(),
         Compiler::Tcc { path } => path.as_path(),
         Compiler::W64DevkitCxx { path } => path.as_path(),
@@ -817,22 +1114,33 @@ fn run_invocation(source_path: &str) -> io::Result<(PathBuf, PathBuf, String)> {
     Ok((parent_dir, executable_path, display_path))
 }
 
+fn source_extension(source_path: &str) -> Option<&str> {
+    Path::new(source_path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+}
+
 fn is_cpp_source(source_path: &str) -> bool {
     matches!(
-        Path::new(source_path)
-            .extension()
-            .and_then(|ext| ext.to_str()),
+        source_extension(source_path),
         Some("cpp" | "cc" | "cxx" | "c++")
     )
 }
 
+fn is_cpp_header(source_path: &str) -> bool {
+    matches!(source_extension(source_path), Some("hh" | "hpp" | "hxx"))
+}
+
+fn is_c_header(source_path: &str) -> bool {
+    matches!(source_extension(source_path), Some("h"))
+}
+
+fn is_header(source_path: &str) -> bool {
+    is_c_header(source_path) || is_cpp_header(source_path)
+}
+
 fn is_c_source(source_path: &str) -> bool {
-    matches!(
-        Path::new(source_path)
-            .extension()
-            .and_then(|ext| ext.to_str()),
-        Some("c")
-    )
+    matches!(source_extension(source_path), Some("c"))
 }
 
 fn compiler_args(source_path: &str, compiler: &Compiler) -> Vec<String> {
@@ -849,6 +1157,56 @@ fn compiler_args(source_path: &str, compiler: &Compiler) -> Vec<String> {
             "-m".into(),
             "py_compile".into(),
             source_path.into(),
+        ]
+    } else if is_header(source_path) && matches!(compiler, Compiler::Msvc { .. }) {
+        let mut args = vec!["/nologo".into(), "/Zs".into()];
+        args.push(if is_cpp_header(source_path) {
+            "/TP".into()
+        } else {
+            "/TC".into()
+        });
+        args.push(source_path.into());
+        args
+    } else if is_header(source_path) && matches!(compiler, Compiler::ZigCc { .. }) {
+        vec![
+            "cc".into(),
+            "-Wall".into(),
+            "-fsyntax-only".into(),
+            "-x".into(),
+            "c-header".into(),
+            source_path.into(),
+        ]
+    } else if is_header(source_path) && matches!(compiler, Compiler::ZigCxx { .. }) {
+        vec![
+            "c++".into(),
+            "-Wall".into(),
+            "-fsyntax-only".into(),
+            "-x".into(),
+            "c++-header".into(),
+            source_path.into(),
+        ]
+    } else if is_header(source_path) && !is_tcc(compiler) {
+        vec![
+            "-Wall".into(),
+            "-fsyntax-only".into(),
+            "-x".into(),
+            if is_cpp_header(source_path) {
+                "c++-header".into()
+            } else {
+                "c-header".into()
+            },
+            source_path.into(),
+        ]
+    } else if is_header(source_path) {
+        vec!["-c".into(), source_path.into()]
+    } else if matches!(compiler, Compiler::ZigCc { .. }) {
+        vec![
+            "cc".into(),
+            "-Wall".into(),
+            "-o".into(),
+            out,
+            source_path.into(),
+            "-lm".into(),
         ]
     } else if matches!(compiler, Compiler::ZigCxx { .. }) {
         vec![
@@ -906,15 +1264,37 @@ fn combine_output(stdout: &[u8], stderr: &[u8]) -> String {
 pub fn compile(source_path: &str, compiler: &Compiler) -> io::Result<BuildResult> {
     let all_flags = compiler_args(source_path, compiler);
     let cmd_line = command_line(compiler_exe(compiler), &all_flags);
-    let result = Command::new(compiler_exe(compiler))
-        .args(&all_flags)
-        .output()?;
+    let attempts = if cfg!(target_os = "windows") {
+        WINDOWS_ACCESS_RETRY_ATTEMPTS
+    } else {
+        1
+    };
 
-    Ok(BuildResult {
-        success: result.status.success(),
-        output: combine_output(&result.stdout, &result.stderr),
-        command_line: cmd_line,
-    })
+    for attempt in 1..=attempts {
+        let mut command = Command::new(compiler_exe(compiler));
+        command.args(&all_flags);
+        let result =
+            run_command_output_timeout(&mut command, BUILD_TIMEOUT, "build/check command")?;
+        let mut output = combine_output(&result.stdout, &result.stderr);
+        let access_denied = output_mentions_access_denied(&output);
+
+        if !result.status.success() && access_denied && attempt < attempts {
+            thread::sleep(WINDOWS_ACCESS_RETRY_DELAY);
+            continue;
+        }
+
+        if !result.status.success() && access_denied {
+            output.push_str("\n\nTinyVim hint: Windows refused access while compiling. The previous program may still be running or antivirus may still be scanning the freshly built/downloaded executable. TinyVim retried automatically; close the running program window, wait a moment, or allow the project/cache folder in Windows Security, then press F5/F6 again.");
+        }
+
+        return Ok(BuildResult {
+            success: result.status.success(),
+            output,
+            command_line: cmd_line,
+        });
+    }
+
+    unreachable!("compile retry loop always returns")
 }
 
 pub fn compile_and_prepare_run(
@@ -1131,6 +1511,34 @@ mod tests {
         );
 
         assert_eq!(display, "uv run --python 3 -- python hello.py");
+    }
+
+    #[test]
+    fn manual_archive_match_accepts_browser_duplicate_names() {
+        assert!(file_name_matches_candidate(
+            "uv-x86_64-pc-windows-msvc (1).zip",
+            "uv-x86_64-pc-windows-msvc.zip"
+        ));
+        assert!(file_name_matches_candidate(
+            "zig-x86_64-linux-0.15.2 (2).tar.xz",
+            "zig-x86_64-linux-0.15.2.tar.xz"
+        ));
+        assert!(file_name_matches_candidate(
+            "uv-x86_64-unknown-linux-musl (1).tar.gz",
+            "uv-x86_64-unknown-linux-musl.tar.gz"
+        ));
+    }
+
+    #[test]
+    fn manual_archive_match_rejects_unrelated_files() {
+        assert!(!file_name_matches_candidate(
+            "not-uv-x86_64-pc-windows-msvc.zip",
+            "uv-x86_64-pc-windows-msvc.zip"
+        ));
+        assert!(!file_name_matches_candidate(
+            "w64devkit-1.21.0.zip",
+            "w64devkit-1.22.0.zip"
+        ));
     }
 
     #[test]

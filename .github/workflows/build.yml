@@ -69,6 +69,7 @@ jobs:
             tinyvim-x86_64-macos \
             tinyvim-aarch64-macos \
             tinyvim-x86_64-windows.exe \
+            tinyvim-windows.cmd \
             --title "${{ github.ref_name }}" \
             --notes "See the [commit log](https://github.com/${{ github.repository }}/commits/${{ github.ref_name }}) for changes."
         env:

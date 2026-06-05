@@ -1,9 +1,11 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::Instant;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyEvent, KeyEventKind};
 
 use crate::ai::AiTurn;
 use crate::buffer::Buffer;
@@ -11,6 +13,24 @@ use crate::builder::{
     compile, compile_and_prepare_run, probe_compilers, select_compiler, BuildResult, CompilerInfo,
     InteractiveRun,
 };
+
+#[derive(Clone, Copy)]
+enum BuildTaskKind {
+    Check { show_success_output: bool },
+    Run,
+}
+
+struct BuildTaskResult {
+    kind: BuildTaskKind,
+    ext: String,
+    result: Result<(BuildResult, Option<InteractiveRun>), String>,
+}
+
+pub struct ActiveTask {
+    label: String,
+    started_at: Instant,
+    receiver: Receiver<BuildTaskResult>,
+}
 
 pub struct FileEntry {
     pub name: String,
@@ -359,10 +379,8 @@ pub struct Editor {
     pub search_query: String,
     pub search_matches: Vec<TextMatch>,
     pub active_search: Option<usize>,
+    pub active_task: Option<ActiveTask>,
     undo_stack: Vec<EditSnapshot>,
-    last_key_time: Instant,
-    last_key_code: Option<KeyCode>,
-    last_key_modifiers: KeyModifiers,
 }
 
 impl Editor {
@@ -412,10 +430,8 @@ impl Editor {
             search_query: String::new(),
             search_matches: Vec::new(),
             active_search: None,
+            active_task: None,
             undo_stack: Vec::new(),
-            last_key_time: Instant::now(),
-            last_key_code: None,
-            last_key_modifiers: KeyModifiers::empty(),
         }
     }
 
@@ -868,6 +884,9 @@ impl Editor {
     }
 
     fn save_without_check(&mut self) -> bool {
+        if !self.buffer.modified {
+            return true;
+        }
         match self.buffer.save() {
             Ok(()) => {
                 self.message = format!("Saved {}", self.buffer.filename());
@@ -898,72 +917,16 @@ impl Editor {
             return;
         }
         let ext = self.buffer.extension().to_string();
-        let (compiler, hint) = select_compiler(&self.compiler_info, &ext);
-        match compiler {
-            None => {
-                let msg = hint.unwrap_or_else(|| {
-                    self.compiler_info
-                        .problem
-                        .clone()
-                        .unwrap_or("No compiler found".into())
-                });
-                self.message = msg.clone();
-                self.build_result = Some(BuildResult {
-                    success: false,
-                    output: msg,
-                    command_line: String::new(),
-                });
-                self.output_scroll = 0;
-                self.show_output = true;
-            }
-            Some(cc) => {
-                self.save_without_check();
-                self.message = if ext == "py" || ext == "pyw" {
-                    "Checking Python...".to_string()
-                } else {
-                    "Compiling...".to_string()
-                };
-                match compile(&path, &cc) {
-                    Ok(result) => {
-                        self.apply_build_result(result, show_success_output);
-                        if let Some(ref r) = self.build_result {
-                            self.message = if r.success {
-                                if ext == "py" || ext == "pyw" {
-                                    "Python check passed".into()
-                                } else {
-                                    "Build succeeded".into()
-                                }
-                            } else {
-                                if ext == "py" || ext == "pyw" {
-                                    "Python check failed".into()
-                                } else {
-                                    "Build failed".into()
-                                }
-                            };
-                            if !r.success && !self.diagnostics.is_empty() {
-                                self.message = format!(
-                                    "{} ({} issue(s))",
-                                    self.message,
-                                    self.diagnostics.len()
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let msg = format!("Compile error: {}", e);
-                        self.message = msg.clone();
-                        self.build_result = Some(BuildResult {
-                            success: false,
-                            output: msg,
-                            command_line: String::new(),
-                        });
-                        self.output_scroll = 0;
-                        self.diagnostics.clear();
-                        self.active_diagnostic = None;
-                        self.show_output = true;
-                    }
-                }
-            }
+        if self.save_without_check() {
+            let label = build_task_label(&ext, false);
+            self.start_build_task(
+                BuildTaskKind::Check {
+                    show_success_output,
+                },
+                label,
+                path,
+                ext,
+            );
         }
     }
 
@@ -974,68 +937,137 @@ impl Editor {
             return;
         }
         let ext = self.buffer.extension().to_string();
-        let (compiler, hint) = select_compiler(&self.compiler_info, &ext);
-        match compiler {
-            None => {
-                let msg = hint.unwrap_or_else(|| {
-                    self.compiler_info
-                        .problem
-                        .clone()
-                        .unwrap_or("No compiler found".into())
-                });
-                self.message = msg.clone();
-                self.build_result = Some(BuildResult {
-                    success: false,
-                    output: msg,
-                    command_line: String::new(),
-                });
-                self.output_scroll = 0;
-                self.show_output = true;
+        if self.save_without_check() {
+            let label = build_task_label(&ext, true);
+            self.start_build_task(BuildTaskKind::Run, label, path, ext);
+        }
+    }
+
+    fn start_build_task(&mut self, kind: BuildTaskKind, label: &str, path: String, ext: String) {
+        if self.active_task.is_some() {
+            self.message = "A build/check task is already running".to_string();
+            return;
+        }
+
+        let compiler_info = self.compiler_info.clone();
+        let problem = self.compiler_info.problem.clone();
+        let label = label.to_string();
+        let (sender, receiver) = mpsc::channel();
+        let worker_ext = ext.clone();
+        let worker_kind = kind;
+
+        thread::spawn(move || {
+            let result = match select_compiler(&compiler_info, &worker_ext) {
+                (None, hint) => Err(hint
+                    .unwrap_or_else(|| problem.unwrap_or_else(|| "No compiler found".to_string()))),
+                (Some(compiler), _) => match worker_kind {
+                    BuildTaskKind::Check { .. } => compile(&path, &compiler)
+                        .map(|result| (result, None))
+                        .map_err(|e| format!("Compile error: {}", e)),
+                    BuildTaskKind::Run => compile_and_prepare_run(&path, &compiler)
+                        .map_err(|e| format!("Error: {}", e)),
+                },
+            };
+            let _ = sender.send(BuildTaskResult {
+                kind: worker_kind,
+                ext: worker_ext,
+                result,
+            });
+        });
+
+        self.message = format!("{}...", label);
+        self.build_result = None;
+        self.show_output = false;
+        self.active_task = Some(ActiveTask {
+            label,
+            started_at: Instant::now(),
+            receiver,
+        });
+    }
+
+    pub fn poll_active_task(&mut self) {
+        let Some(task) = self.active_task.as_ref() else {
+            return;
+        };
+        match task.receiver.try_recv() {
+            Ok(result) => {
+                self.active_task = None;
+                self.apply_build_task_result(result);
             }
-            Some(cc) => {
-                self.save_without_check();
-                self.message = if ext == "py" || ext == "pyw" {
-                    "Checking & running Python...".to_string()
-                } else {
-                    "Compiling & running...".to_string()
-                };
-                match compile_and_prepare_run(&path, &cc) {
-                    Ok((result, run)) => {
-                        if result.success {
-                            self.pending_run = run;
-                            self.show_output = false;
-                            self.message = "Running in terminal...".into();
-                            self.build_result = Some(result);
-                            self.output_scroll = 0;
-                            self.diagnostics.clear();
-                            self.active_diagnostic = None;
-                        } else {
-                            self.apply_build_result(result, true);
-                            if let Some(ref r) = self.build_result {
-                                self.message = if r.success {
-                                    "Ready to run".into()
-                                } else {
-                                    "Build/check failed".into()
-                                };
-                            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.active_task = None;
+                self.set_task_error("Build/check task stopped unexpectedly".to_string());
+            }
+        }
+    }
+
+    fn apply_build_task_result(&mut self, task: BuildTaskResult) {
+        match task.kind {
+            BuildTaskKind::Check {
+                show_success_output,
+            } => match task.result {
+                Ok((result, _)) => {
+                    self.apply_build_result(result, show_success_output);
+                    if let Some(ref r) = self.build_result {
+                        self.message = check_message(&task.ext, r.success);
+                        if !r.success && !self.diagnostics.is_empty() {
+                            self.message =
+                                format!("{} ({} issue(s))", self.message, self.diagnostics.len());
                         }
                     }
-                    Err(e) => {
-                        let msg = format!("Error: {}", e);
-                        self.message = msg.clone();
-                        self.build_result = Some(BuildResult {
-                            success: false,
-                            output: msg,
-                            command_line: String::new(),
-                        });
+                }
+                Err(e) => self.set_task_error(e),
+            },
+            BuildTaskKind::Run => match task.result {
+                Ok((result, run)) => {
+                    if result.success {
+                        self.pending_run = run;
+                        self.show_output = false;
+                        self.message = "Running in terminal...".into();
+                        self.build_result = Some(result);
                         self.output_scroll = 0;
                         self.diagnostics.clear();
                         self.active_diagnostic = None;
-                        self.show_output = true;
+                    } else {
+                        self.apply_build_result(result, true);
+                        self.message = "Build/check failed".into();
                     }
                 }
-            }
+                Err(e) => self.set_task_error(e),
+            },
         }
+    }
+
+    fn set_task_error(&mut self, msg: String) {
+        self.message = msg.clone();
+        self.build_result = Some(BuildResult {
+            success: false,
+            output: msg,
+            command_line: String::new(),
+        });
+        self.output_scroll = 0;
+        self.diagnostics.clear();
+        self.active_diagnostic = None;
+        self.show_output = true;
+    }
+
+    pub fn active_task_status(&self) -> Option<String> {
+        let task = self.active_task.as_ref()?;
+        let elapsed = task.started_at.elapsed().as_secs();
+        let phase = (elapsed as usize) % 20;
+        let mut bar = String::from("[");
+        for idx in 0..20 {
+            bar.push(if idx == phase {
+                '>'
+            } else if idx < phase {
+                '='
+            } else {
+                ' '
+            });
+        }
+        bar.push(']');
+        Some(format!("{} {}s {}", bar, elapsed, task.label))
     }
 
     fn apply_build_result(&mut self, result: BuildResult, show_success_output: bool) {
@@ -1276,27 +1308,7 @@ impl Editor {
     }
 
     pub fn should_ignore_key(&mut self, key: &KeyEvent) -> bool {
-        if key.kind == KeyEventKind::Release {
-            return true;
-        }
-
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_key_time).as_millis();
-        let same_key = self.last_key_code.as_ref() == Some(&key.code)
-            && self.last_key_modifiers == key.modifiers;
-        let duplicate_press = cfg!(target_os = "windows")
-            && key.kind == KeyEventKind::Press
-            && same_key
-            && elapsed < 90;
-
-        if duplicate_press {
-            return true;
-        }
-
-        self.last_key_time = now;
-        self.last_key_code = Some(key.code);
-        self.last_key_modifiers = key.modifiers;
-        false
+        key.kind == KeyEventKind::Release
     }
 
     pub fn scroll_offset(&self, view_height: usize) -> usize {
@@ -1364,6 +1376,59 @@ fn is_checkable_extension(ext: &str) -> bool {
         ext,
         "c" | "h" | "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" | "py" | "pyw"
     )
+}
+
+fn check_message(ext: &str, success: bool) -> String {
+    let action = if matches!(ext, "py" | "pyw") {
+        "Python check"
+    } else if matches!(ext, "h" | "hh" | "hpp" | "hxx") {
+        "Header check"
+    } else {
+        "Compile"
+    };
+    let status = if success { "passed" } else { "failed" };
+    format!("{} {}", action, status)
+}
+
+fn build_task_label(ext: &str, before_run: bool) -> &'static str {
+    let action = if before_run { "before run" } else { "check" };
+    match ext {
+        "py" | "pyw" => {
+            if before_run {
+                "Preparing Python/uv before run"
+            } else {
+                "Preparing Python/uv check"
+            }
+        }
+        "c" | "h" => {
+            if cfg!(target_os = "windows") {
+                if before_run {
+                    "Preparing C compiler/TCC before run"
+                } else {
+                    "Preparing C compiler/TCC check"
+                }
+            } else if before_run {
+                "Preparing C compiler/Zig cc before run"
+            } else {
+                "Preparing C compiler/Zig cc check"
+            }
+        }
+        "cc" | "cpp" | "cxx" | "c++" | "hh" | "hpp" | "hxx" => {
+            if cfg!(target_os = "windows") {
+                if before_run {
+                    "Preparing C++ compiler/w64devkit before run"
+                } else {
+                    "Preparing C++ compiler/w64devkit check"
+                }
+            } else if before_run {
+                "Preparing C++ compiler/Zig before run"
+            } else {
+                "Preparing C++ compiler/Zig check"
+            }
+        }
+        _ if action == "before run" => "Preparing tools before run",
+        _ => "Preparing tools check",
+    }
 }
 
 pub fn parse_diagnostics(output: &str) -> Vec<Diagnostic> {

@@ -4,13 +4,14 @@ mod builder;
 mod editor;
 mod ui;
 
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-    MouseButton, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -23,7 +24,115 @@ use buffer::Buffer;
 use builder::InteractiveRun;
 use editor::Editor;
 
+const WINDOWS_ACCESS_RETRY_ATTEMPTS: usize = 8;
+const WINDOWS_ACCESS_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+#[cfg(windows)]
+fn prepare_windows_console() {
+    use winapi::um::consoleapi::{GetConsoleMode, SetConsoleMode};
+    use winapi::um::processenv::GetStdHandle;
+    use winapi::um::winbase::STD_OUTPUT_HANDLE;
+    use winapi::um::wincon::{
+        SetConsoleCP, SetConsoleOutputCP, ENABLE_PROCESSED_OUTPUT,
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+    };
+
+    const UTF8_CODE_PAGE: u32 = 65001;
+
+    unsafe {
+        SetConsoleCP(UTF8_CODE_PAGE);
+        SetConsoleOutputCP(UTF8_CODE_PAGE);
+
+        let out = GetStdHandle(STD_OUTPUT_HANDLE);
+        let mut mode = 0;
+        if GetConsoleMode(out, &mut mode) != 0 {
+            SetConsoleMode(
+                out,
+                mode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+            );
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn prepare_windows_console() {}
+
+#[cfg(windows)]
+fn prepare_windows_interactive_console() {
+    use winapi::um::consoleapi::{GetConsoleMode, SetConsoleMode};
+    use winapi::um::processenv::GetStdHandle;
+    use winapi::um::winbase::STD_INPUT_HANDLE;
+    use winapi::um::wincon::{
+        ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_MOUSE_INPUT, ENABLE_PROCESSED_INPUT,
+        ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_WINDOW_INPUT,
+    };
+
+    prepare_windows_console();
+
+    unsafe {
+        let input = GetStdHandle(STD_INPUT_HANDLE);
+        let mut mode = 0;
+        if GetConsoleMode(input, &mut mode) != 0 {
+            let interactive_mode =
+                (mode | ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT)
+                    & !(ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT | ENABLE_VIRTUAL_TERMINAL_INPUT);
+            SetConsoleMode(input, interactive_mode);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn prepare_windows_interactive_console() {}
+
+fn is_windows_access_denied(error: &io::Error) -> bool {
+    cfg!(target_os = "windows")
+        && (error.kind() == io::ErrorKind::PermissionDenied || error.raw_os_error() == Some(5))
+}
+
+fn run_status_with_windows_access_retry(
+    command: &mut Command,
+    label: &str,
+) -> io::Result<std::process::ExitStatus> {
+    let program = std::path::Path::new(command.get_program()).to_path_buf();
+    let mut last_error = None;
+
+    for attempt in 1..=WINDOWS_ACCESS_RETRY_ATTEMPTS {
+        match command.status() {
+            Ok(status) => return Ok(status),
+            Err(e) if is_windows_access_denied(&e) && attempt < WINDOWS_ACCESS_RETRY_ATTEMPTS => {
+                last_error = Some(e);
+                std::thread::sleep(WINDOWS_ACCESS_RETRY_DELAY);
+            }
+            Err(e) if is_windows_access_denied(&e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Windows denied access while starting {} ({}). TinyVim retried automatically. Original error: {}. Close any still-running program window, wait a moment, or allow the project/cache folder in Windows Security, then try again.",
+                        label,
+                        program.display(),
+                        e
+                    ),
+                ));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    let error = last_error.unwrap_or_else(|| io::Error::from(io::ErrorKind::PermissionDenied));
+    Err(io::Error::new(
+        error.kind(),
+        format!(
+            "Windows denied access while starting {} ({}). TinyVim retried automatically. Original error: {}. Close any still-running program window, wait a moment, or allow the project/cache folder in Windows Security, then try again.",
+            label,
+            program.display(),
+            error
+        ),
+    ))
+}
+
 fn main() -> io::Result<()> {
+    prepare_windows_console();
+
     let args: Vec<String> = std::env::args().collect();
     let buffer = if args.len() > 1 {
         Buffer::load(&args[1]).unwrap_or_else(|_| {
@@ -38,7 +147,8 @@ fn main() -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
-    stdout.execute(EnableMouseCapture)?;
+    let _ = stdout.execute(EnableMouseCapture);
+    let _ = stdout.execute(EnableBracketedPaste);
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -48,15 +158,8 @@ fn main() -> io::Result<()> {
     let mut result = Ok(());
 
     while !editor.quit {
+        editor.poll_active_task();
         terminal.draw(|f| ui::render(f, &editor))?;
-        if let Err(e) = handle_event(&mut editor) {
-            if e.kind() == io::ErrorKind::Interrupted {
-                editor.quit = true;
-            } else {
-                result = Err(e);
-                break;
-            }
-        }
         if let Some(run) = editor.pending_run.take() {
             match run_interactive(&mut terminal, run) {
                 Ok(message) => editor.message = message,
@@ -71,13 +174,28 @@ fn main() -> io::Result<()> {
                     editor.show_output = true;
                 }
             }
+            continue;
+        }
+        let should_read_event =
+            editor.active_task.is_none() || event::poll(Duration::from_millis(120))?;
+        if should_read_event {
+            if let Err(e) = handle_event(&mut editor) {
+                if e.kind() == io::ErrorKind::Interrupted {
+                    editor.quit = true;
+                } else {
+                    result = Err(e);
+                    break;
+                }
+            }
         }
     }
 
-    disable_raw_mode()?;
-    terminal.backend_mut().execute(DisableMouseCapture)?;
-    terminal.backend_mut().execute(LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    let _ = terminal.backend_mut().execute(DisableBracketedPaste);
+    let _ = terminal.backend_mut().execute(DisableMouseCapture);
+    let _ = disable_raw_mode();
+    prepare_windows_interactive_console();
+    let _ = terminal.backend_mut().execute(LeaveAlternateScreen);
+    let _ = terminal.show_cursor();
     result
 }
 
@@ -85,8 +203,10 @@ fn run_interactive(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     run: InteractiveRun,
 ) -> io::Result<String> {
+    let _ = terminal.backend_mut().execute(DisableBracketedPaste);
+    let _ = terminal.backend_mut().execute(DisableMouseCapture);
     disable_raw_mode()?;
-    terminal.backend_mut().execute(DisableMouseCapture)?;
+    prepare_windows_interactive_console();
     terminal.backend_mut().execute(LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
@@ -94,23 +214,34 @@ fn run_interactive(
     println!("Interactive input is enabled for cin, scanf, and input().");
     println!();
     println!("$ cd {} && {}", run.cwd.display(), run.display);
-    let status = Command::new(&run.program)
+    io::stdout().flush()?;
+    let mut command = Command::new(&run.program);
+    command
         .current_dir(&run.cwd)
         .args(&run.args)
-        .status();
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .env("PYTHONUTF8", "1")
+        .env("PYTHONIOENCODING", "utf-8");
+    let status = run_status_with_windows_access_retry(&mut command, "your program");
 
+    prepare_windows_interactive_console();
     println!();
     match &status {
         Ok(status) => println!("Process exited with status: {}", status),
         Err(e) => println!("Failed to run process: {}", e),
     }
     println!("Press Enter to return to TinyVim...");
+    io::stdout().flush()?;
     let mut line = String::new();
     let _ = io::stdin().read_line(&mut line);
 
+    prepare_windows_console();
     enable_raw_mode()?;
     terminal.backend_mut().execute(EnterAlternateScreen)?;
-    terminal.backend_mut().execute(EnableMouseCapture)?;
+    let _ = terminal.backend_mut().execute(EnableMouseCapture);
+    let _ = terminal.backend_mut().execute(EnableBracketedPaste);
     terminal.clear()?;
     terminal.show_cursor()?;
 
@@ -193,6 +324,12 @@ fn handle_event(editor: &mut Editor) -> io::Result<()> {
                 KeyCode::PageDown => editor.page_down(),
                 KeyCode::F(f) => handle_fkey(editor, f, key.modifiers),
                 _ => {}
+            }
+        }
+        Event::Paste(text) => {
+            editor.confirm_quit = false;
+            for ch in text.chars() {
+                editor.insert_char(ch);
             }
         }
         Event::Mouse(mouse) => match mouse.kind {
@@ -376,6 +513,9 @@ fn handle_prompt(editor: &mut Editor) -> io::Result<()> {
                 KeyCode::PageDown if editor.show_output && editor.build_result.is_some() => {
                     editor.scroll_output_down(10);
                 }
+                KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    paste_system_clipboard_into_prompt(editor);
+                }
                 KeyCode::Char(c) => {
                     if editor.pending_ai_apply {
                         handle_ai_apply_prompt(editor, c.to_string());
@@ -530,6 +670,11 @@ fn handle_prompt(editor: &mut Editor) -> io::Result<()> {
                 _ => {}
             }
         }
+        Event::Paste(text) => {
+            if let Some(ref mut p) = editor.prompt {
+                p.input.push_str(&prompt_paste_text(&text));
+            }
+        }
         Event::Mouse(mouse) => match mouse.kind {
             MouseEventKind::ScrollUp => handle_mouse_scroll(editor, mouse.row, true),
             MouseEventKind::ScrollDown => handle_mouse_scroll(editor, mouse.row, false),
@@ -541,6 +686,83 @@ fn handle_prompt(editor: &mut Editor) -> io::Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+fn paste_system_clipboard_into_prompt(editor: &mut Editor) {
+    match read_system_clipboard() {
+        Ok(text) if !text.is_empty() => {
+            if let Some(ref mut prompt) = editor.prompt {
+                prompt.input.push_str(&prompt_paste_text(&text));
+                editor.message = "Pasted from system clipboard".to_string();
+            }
+        }
+        Ok(_) => {
+            editor.message = "System clipboard is empty".to_string();
+        }
+        Err(e) => {
+            editor.message = format!("Paste failed: {}", e);
+        }
+    }
+}
+
+fn prompt_paste_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace(['\r', '\n'], " ")
+}
+
+fn read_system_clipboard() -> Result<String, String> {
+    let candidates: &[(&str, &[&str])] = if cfg!(target_os = "windows") {
+        &[
+            (
+                "powershell.exe",
+                &[
+                    "-NoProfile",
+                    "-Command",
+                    "[Console]::OutputEncoding=[Text.UTF8Encoding]::UTF8; Get-Clipboard -Raw",
+                ],
+            ),
+            (
+                "powershell",
+                &[
+                    "-NoProfile",
+                    "-Command",
+                    "[Console]::OutputEncoding=[Text.UTF8Encoding]::UTF8; Get-Clipboard -Raw",
+                ],
+            ),
+            (
+                "pwsh",
+                &[
+                    "-NoProfile",
+                    "-Command",
+                    "[Console]::OutputEncoding=[Text.UTF8Encoding]::UTF8; Get-Clipboard -Raw",
+                ],
+            ),
+        ]
+    } else if cfg!(target_os = "macos") {
+        &[("pbpaste", &[])]
+    } else {
+        &[
+            ("wl-paste", &["--no-newline"]),
+            ("xclip", &["-selection", "clipboard", "-o"]),
+            ("xsel", &["--clipboard", "--output"]),
+        ]
+    };
+
+    let mut last_error = "no clipboard command available".to_string();
+    for (program, args) in candidates {
+        match Command::new(program).args(*args).output() {
+            Ok(output) if output.status.success() => {
+                return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                last_error = format!("{} exited with {}: {}", program, output.status, stderr);
+            }
+            Err(e) => {
+                last_error = format!("{}: {}", program, e);
+            }
+        }
+    }
+    Err(last_error)
 }
 
 fn handle_ctrl(editor: &mut Editor, c: char) {
@@ -664,22 +886,51 @@ fn handle_ai_key_prompt(editor: &mut Editor, api_key: String) {
             editor.pending_ai_setup_chat = false;
             let setup_only = editor.pending_ai_setup_only;
             editor.pending_ai_setup_only = false;
-            if setup_only {
-                editor.message = if ai::env_overrides_ai_config() {
-                    "AI config saved, but environment variables still override it. Update or clear TINYVIM_AI_API_KEY/OPENAI_API_KEY.".to_string()
-                } else {
-                    "AI config saved. Press Ctrl+R to chat or Ctrl+E to edit.".to_string()
-                };
-            } else {
-                start_configured_ai_flow(editor, chat);
-                editor.message = if chat {
-                    "AI config saved. Ask AI a question.".to_string()
-                } else {
-                    "AI config saved. Describe the code change.".to_string()
-                };
+
+            match ai::test_current_config() {
+                Ok(test_message) => {
+                    if setup_only {
+                        if ai::env_overrides_ai_config() {
+                            show_ai_panel(
+                                editor,
+                                format!(
+                                    "{test_message}\n\nSaved config exists, but environment variables still override it.\nUpdate or clear TINYVIM_AI_API_KEY / OPENAI_API_KEY if this is not the key you just pasted."
+                                ),
+                                "AI config test",
+                                "AI config saved, but environment variables still win.",
+                            );
+                        } else {
+                            show_ai_panel(
+                                editor,
+                                test_message,
+                                "AI config test",
+                                "AI config saved and tested. Press Ctrl+R to chat or Ctrl+E to edit.",
+                            );
+                        }
+                    } else {
+                        start_configured_ai_flow(editor, chat);
+                        let message = if chat {
+                            "AI config saved and tested. Ask AI a question."
+                        } else {
+                            "AI config saved and tested. Describe the code change."
+                        };
+                        show_ai_panel(editor, test_message, "AI config test", message);
+                    }
+                }
+                Err(e) => {
+                    show_ai_panel_with_status(
+                        editor,
+                        false,
+                        ai::auth_error_detail(&e),
+                        "AI config test",
+                        "AI config saved, but test failed. Press F2 and paste the full key again.",
+                    );
+                }
             }
         }
-        Err(e) => editor.message = e,
+        Err(e) => {
+            show_ai_error(editor, e, Some(false));
+        }
     }
 }
 
@@ -704,7 +955,7 @@ fn handle_ai_model_prompt(editor: &mut Editor, model: String) {
     editor.pending_ai_setup_model = Some(model);
     editor.pending_ai_key = true;
     editor.prompt = Some(editor::Prompt::secret("AI API Key:"));
-    editor.message = "Paste API key. It is hidden and saved only on this computer.".to_string();
+    editor.message = "Paste API key. Input is hidden; Ctrl+V uses system clipboard.".to_string();
 }
 
 fn handle_ai_edit_prompt(editor: &mut Editor, instruction: String) {
@@ -795,8 +1046,45 @@ fn handle_ai_chat_prompt(editor: &mut Editor, question: String) {
             reopen_ai_chat(editor);
         }
         Err(e) => {
-            editor.message = e;
+            show_ai_error(editor, e, Some(true));
+        }
+    }
+}
+
+fn show_ai_error(editor: &mut Editor, error: String, reopen_chat: Option<bool>) {
+    if ai::is_auth_error_message(&error) {
+        show_ai_panel(
+            editor,
+            ai::auth_error_detail(&error),
+            "AI auth error",
+            "AI key was rejected. Reconfigure below, or press Esc and fix environment variables.",
+        );
+        if ai::env_overrides_ai_config() {
+            if reopen_chat == Some(true) {
+                reopen_ai_chat(editor);
+            } else if reopen_chat == Some(false) {
+                reopen_ai_edit(editor);
+            }
+        } else {
+            let resume_chat = reopen_chat.unwrap_or(false);
+            editor.pending_ai_setup_chat = resume_chat;
+            editor.pending_ai_setup_only = reopen_chat.is_none();
+            editor.pending_ai_edit = false;
+            editor.pending_ai_chat = false;
+            editor.pending_ai_apply = false;
+            editor.pending_ai_edit_content = None;
+            editor.pending_ai_base_url = true;
+            editor.prompt = Some(editor::Prompt::with_input(
+                "AI Base URL:",
+                ai::default_base_url(),
+            ));
+        }
+    } else {
+        editor.message = error;
+        if reopen_chat == Some(true) {
             reopen_ai_chat(editor);
+        } else if reopen_chat == Some(false) {
+            reopen_ai_edit(editor);
         }
     }
 }
@@ -811,8 +1099,18 @@ fn show_ai_output(editor: &mut Editor, output: String) {
 }
 
 fn show_ai_panel(editor: &mut Editor, output: String, command_line: &str, message: &str) {
+    show_ai_panel_with_status(editor, true, output, command_line, message);
+}
+
+fn show_ai_panel_with_status(
+    editor: &mut Editor,
+    success: bool,
+    output: String,
+    command_line: &str,
+    message: &str,
+) {
     editor.build_result = Some(builder::BuildResult {
-        success: true,
+        success,
         output,
         command_line: command_line.to_string(),
     });
@@ -825,6 +1123,11 @@ fn show_ai_panel(editor: &mut Editor, output: String, command_line: &str, messag
 fn reopen_ai_chat(editor: &mut Editor) {
     editor.pending_ai_chat = true;
     editor.prompt = Some(editor::Prompt::new("AI Chat:"));
+}
+
+fn reopen_ai_edit(editor: &mut Editor) {
+    editor.pending_ai_edit = true;
+    editor.prompt = Some(editor::Prompt::new("AI Edit:"));
 }
 
 fn handle_ai_apply_prompt(editor: &mut Editor, answer: String) {
